@@ -83,3 +83,7 @@ On first launch a configuration dialog is shown. It can also be opened from the 
 Settings are stored under `HKEY_CURRENT_USER\SOFTWARE\JPIT\APIMonitor`.
 
 If a `config.ini` file exists from a previous version, settings are migrated to the registry on first launch.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
