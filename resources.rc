@@ -1,0 +1,11 @@
+// resources.rc
+#include "resource.h"
+
+// Application icon (shows in taskbar, file explorer)
+IDI_APPICON ICON "success.ico"
+
+// Embedded icons
+IDI_EMPTY   ICON "empty.ico"
+IDI_SUCCESS ICON "success.ico"
+IDI_FAIL    ICON "fail.ico"
+IDI_BLANK   ICON "blank.ico"
