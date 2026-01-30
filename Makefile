@@ -7,6 +7,7 @@ WINDRES = x86_64-w64-mingw32-windres
 TARGET = APIMonitor.exe
 SOURCES = main.c
 RESOURCES = resources.rc
+RELEASE_DIR = release
 
 OBJ = main.o resources.o
 
@@ -19,13 +20,14 @@ LIBS = -lwinhttp -lshell32 -luser32 -lgdi32 -ladvapi32
 
 .PHONY: all clean icons
 
-all: $(TARGET)
+all: $(RELEASE_DIR)/$(TARGET)
 
-$(TARGET): $(OBJ)
+$(RELEASE_DIR)/$(TARGET): $(OBJ)
 	@echo "Linking executable..."
+	@mkdir -p $(RELEASE_DIR)
 	$(CC) -o $@ $(OBJ) $(LDFLAGS) $(LIBS)
 	@rm -f $(OBJ)
-	@echo "Build complete: $(TARGET)"
+	@echo "Build complete: $(RELEASE_DIR)/$(TARGET)"
 
 main.o: $(SOURCES) resource.h
 	@echo "Compiling $(SOURCES)..."
@@ -49,4 +51,5 @@ icons:
 	done
 
 clean:
-	rm -f $(OBJ) $(TARGET)
+	rm -f $(OBJ)
+	rm -rf $(RELEASE_DIR)
