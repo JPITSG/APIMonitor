@@ -33,6 +33,10 @@
 #define IDC_COMBO_INTERVAL  2103
 #define IDC_STATIC_INTERVAL 2104
 #define IDC_CHECK_LOGGING   2105
+#define IDC_STATIC_VALID_LABEL  2106
+#define IDC_STATIC_VALID_STATUS 2107
+#define IDT_VALIDATE_DEBOUNCE   3001
+#define WM_VALIDATE_RESULT      (WM_APP + 1)
 
 typedef enum {
     RESULT_ERROR,        // Connection/network error
@@ -74,6 +78,15 @@ static HANDLE g_hMutex = NULL;  // Mutex for single instance check
 static CRITICAL_SECTION logCriticalSection;  // For thread-safe logging
 static BOOL configLoggingEnabled = TRUE; // Global variable for logging toggle (default true)
 
+// URL validation thread params
+typedef struct {
+    char url[512];
+    HWND hDlg;
+    LONG generation;
+} ValidateParams;
+
+static volatile LONG g_validateGeneration = 0;
+
 // Display settings tracking (for RDP reconnect icon refresh)
 static int lastScreenWidth = 0;
 static int lastScreenHeight = 0;
@@ -106,6 +119,7 @@ BOOL HasDisplaySettingsChanged();
 void RefreshTrayIconForNewResolution();
 void LogMessage(const char* format, ...);
 void CheckLogFileSize();
+DWORD WINAPI ValidateUrlThread(LPVOID param);
 
 // Logging function: writes to ProgramData\APIMonitor.log with timestamp and thread ID
 void LogMessage(const char* format, ...) {
@@ -547,12 +561,29 @@ static BYTE* AddDialogControl(BYTE* ptr, WORD ctrlId, WORD classAtom, DWORD styl
     return ptr;
 }
 
+// Helper: launch a validation thread for the given URL
+static void StartValidation(HWND hDlg, const char* url) {
+    LONG gen = InterlockedIncrement(&g_validateGeneration);
+    ValidateParams* vp = (ValidateParams*)malloc(sizeof(ValidateParams));
+    if (!vp) return;
+    strncpy(vp->url, url, sizeof(vp->url) - 1);
+    vp->url[sizeof(vp->url) - 1] = '\0';
+    vp->hDlg = hDlg;
+    vp->generation = gen;
+    HANDLE hThread = CreateThread(NULL, 0, ValidateUrlThread, vp, 0, NULL);
+    if (hThread) CloseHandle(hThread);
+    else free(vp);
+}
+
 // Configuration dialog procedure
 static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
-    UNREFERENCED_PARAMETER(lParam);
+    // 0=none, 1=checking, 2=valid, 3=invalid
+    static int validationState = 0;
 
     switch (message) {
         case WM_INITDIALOG: {
+            validationState = 0;
+
             // Set URL
             SetDlgItemTextA(hDlg, IDC_EDIT_URL, configApiUrl);
 
@@ -579,12 +610,45 @@ static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT message, WPARAM wParam,
             int y = rcScreen.top + ((rcScreen.bottom - rcScreen.top) - (rcDlg.bottom - rcDlg.top)) / 2;
             SetWindowPos(hDlg, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
 
+            // If URL is non-empty, trigger immediate validation
+            if (configApiUrl[0] != '\0') {
+                SetDlgItemTextA(hDlg, IDC_STATIC_VALID_STATUS, "Checking...");
+                validationState = 1;
+                InvalidateRect(GetDlgItem(hDlg, IDC_STATIC_VALID_STATUS), NULL, TRUE);
+                StartValidation(hDlg, configApiUrl);
+            }
+
             return TRUE;
         }
 
         case WM_COMMAND:
+            if (HIWORD(wParam) == EN_CHANGE && LOWORD(wParam) == IDC_EDIT_URL) {
+                char url[512];
+                GetDlgItemTextA(hDlg, IDC_EDIT_URL, url, sizeof(url));
+
+                // Trim whitespace for check
+                char* p = url;
+                while (*p && isspace((unsigned char)*p)) p++;
+
+                if (*p == '\0') {
+                    // Empty URL
+                    SetDlgItemTextA(hDlg, IDC_STATIC_VALID_STATUS, "");
+                    validationState = 0;
+                    KillTimer(hDlg, IDT_VALIDATE_DEBOUNCE);
+                    InterlockedIncrement(&g_validateGeneration); // cancel pending
+                } else {
+                    SetDlgItemTextA(hDlg, IDC_STATIC_VALID_STATUS, "Checking...");
+                    validationState = 1;
+                    KillTimer(hDlg, IDT_VALIDATE_DEBOUNCE);
+                    SetTimer(hDlg, IDT_VALIDATE_DEBOUNCE, 500, NULL);
+                }
+                InvalidateRect(GetDlgItem(hDlg, IDC_STATIC_VALID_STATUS), NULL, TRUE);
+                return TRUE;
+            }
             switch (LOWORD(wParam)) {
                 case IDOK: {
+                    KillTimer(hDlg, IDT_VALIDATE_DEBOUNCE);
+
                     // Get URL
                     char url[512];
                     GetDlgItemTextA(hDlg, IDC_EDIT_URL, url, sizeof(url));
@@ -626,16 +690,202 @@ static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT message, WPARAM wParam,
                 }
 
                 case IDCANCEL:
+                    KillTimer(hDlg, IDT_VALIDATE_DEBOUNCE);
                     EndDialog(hDlg, IDCANCEL);
                     return TRUE;
             }
             break;
 
+        case WM_TIMER:
+            if (wParam == IDT_VALIDATE_DEBOUNCE) {
+                KillTimer(hDlg, IDT_VALIDATE_DEBOUNCE);
+
+                char url[512];
+                GetDlgItemTextA(hDlg, IDC_EDIT_URL, url, sizeof(url));
+
+                // Trim whitespace
+                char* p = url;
+                while (*p && isspace((unsigned char)*p)) p++;
+                char* end = p + strlen(p) - 1;
+                while (end > p && isspace((unsigned char)*end)) *end-- = '\0';
+
+                if (*p != '\0') {
+                    StartValidation(hDlg, p);
+                }
+                return TRUE;
+            }
+            break;
+
+        case WM_VALIDATE_RESULT:
+            if ((LONG)wParam == g_validateGeneration) {
+                if (lParam) {
+                    SetDlgItemTextA(hDlg, IDC_STATIC_VALID_STATUS, "Valid");
+                    validationState = 2;
+                } else {
+                    SetDlgItemTextA(hDlg, IDC_STATIC_VALID_STATUS, "Invalid");
+                    validationState = 3;
+                }
+                InvalidateRect(GetDlgItem(hDlg, IDC_STATIC_VALID_STATUS), NULL, TRUE);
+            }
+            return TRUE;
+
+        case WM_CTLCOLORSTATIC: {
+            HWND hCtrl = (HWND)lParam;
+            if (hCtrl == GetDlgItem(hDlg, IDC_STATIC_VALID_STATUS)) {
+                HDC hdc = (HDC)wParam;
+                if (validationState == 2)
+                    SetTextColor(hdc, RGB(0, 128, 0));
+                else if (validationState == 3)
+                    SetTextColor(hdc, RGB(192, 0, 0));
+                else if (validationState == 1)
+                    SetTextColor(hdc, RGB(128, 128, 128));
+                SetBkColor(hdc, GetSysColor(COLOR_BTNFACE));
+                return (INT_PTR)GetSysColorBrush(COLOR_BTNFACE);
+            }
+            break;
+        }
+
         case WM_CLOSE:
+            KillTimer(hDlg, IDT_VALIDATE_DEBOUNCE);
             EndDialog(hDlg, IDCANCEL);
             return TRUE;
     }
     return FALSE;
+}
+
+// Validation thread: makes HTTP GET and posts result back to dialog
+DWORD WINAPI ValidateUrlThread(LPVOID param) {
+    ValidateParams* vp = (ValidateParams*)param;
+    HWND hDlg = vp->hDlg;
+    LONG myGen = vp->generation;
+    LRESULT valid = 0;
+
+    // Parse URL
+    char urlCopy[512];
+    strncpy(urlCopy, vp->url, sizeof(urlCopy) - 1);
+    urlCopy[sizeof(urlCopy) - 1] = '\0';
+
+    char* host = NULL;
+    char* path = NULL;
+    int port = 80;
+    BOOL isHttps = FALSE;
+
+    if (strncmp(urlCopy, "http://", 7) == 0) {
+        host = urlCopy + 7;
+    } else if (strncmp(urlCopy, "https://", 8) == 0) {
+        host = urlCopy + 8;
+        port = 443;
+        isHttps = TRUE;
+    } else {
+        host = urlCopy;
+    }
+
+    char* slash = strchr(host, '/');
+    if (slash) {
+        *slash = '\0';
+        path = slash + 1;
+    } else {
+        path = "";
+    }
+
+    char* colon = strchr(host, ':');
+    if (colon) {
+        *colon = '\0';
+        port = atoi(colon + 1);
+    }
+
+    wchar_t wHost[256], wPath[512];
+    MultiByteToWideChar(CP_UTF8, 0, host, -1, wHost, 256);
+    char fullPath[512] = "/";
+    if (strlen(path) > 0) {
+        sprintf(fullPath, "/%s", path);
+    }
+    MultiByteToWideChar(CP_UTF8, 0, fullPath, -1, wPath, 512);
+
+    HINTERNET hSession = NULL, hConnect = NULL, hRequest = NULL;
+
+    hSession = WinHttpOpen(L"APIMonitor/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) goto cleanup;
+
+    hConnect = WinHttpConnect(hSession, wHost, (INTERNET_PORT)port, 0);
+    if (!hConnect) goto cleanup;
+
+    {
+        DWORD flags = isHttps ? WINHTTP_FLAG_SECURE : 0;
+        hRequest = WinHttpOpenRequest(hConnect, L"GET", wPath,
+                                     NULL, WINHTTP_NO_REFERER,
+                                     WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    }
+    if (!hRequest) goto cleanup;
+
+    // 5 second timeouts
+    {
+        int timeout = 5000;
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+    }
+
+    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                           WINHTTP_NO_REQUEST_DATA, 0, 0, 0))
+        goto cleanup;
+
+    if (!WinHttpReceiveResponse(hRequest, NULL))
+        goto cleanup;
+
+    {
+        DWORD statusCode = 0, size = sizeof(statusCode);
+        if (!WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                NULL, &statusCode, &size, NULL))
+            goto cleanup;
+        if (statusCode != 200)
+            goto cleanup;
+    }
+
+    // Read response body
+    {
+        char response[4096] = {0};
+        DWORD totalSize = 0, downloaded = 0;
+
+        do {
+            DWORD sizeAvailable = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &sizeAvailable)) break;
+            if (sizeAvailable == 0) break;
+
+            char* buffer = malloc(sizeAvailable + 1);
+            if (!buffer) break;
+            if (!WinHttpReadData(hRequest, buffer, sizeAvailable, &downloaded)) {
+                free(buffer);
+                break;
+            }
+            buffer[downloaded] = '\0';
+
+            if (totalSize + downloaded < sizeof(response) - 1) {
+                strcat(response, buffer);
+                totalSize += downloaded;
+            }
+            free(buffer);
+        } while (downloaded > 0);
+
+        // Check for expected XML tags
+        if (strstr(response, "<result") || strstr(response, "<r>")) {
+            valid = 1;
+        }
+    }
+
+cleanup:
+    if (hRequest) WinHttpCloseHandle(hRequest);
+    if (hConnect) WinHttpCloseHandle(hConnect);
+    if (hSession) WinHttpCloseHandle(hSession);
+
+    // Only post result if this generation is still current
+    if (InterlockedCompareExchange(&g_validateGeneration, myGen, myGen) == myGen) {
+        PostMessage(hDlg, WM_VALIDATE_RESULT, (WPARAM)myGen, valid);
+    }
+
+    free(vp);
+    return 0;
 }
 
 // Create and show configuration dialog
@@ -653,9 +903,10 @@ void ShowConfigDialog(HWND hwndParent) {
     const short COMBO_DROPDOWN = 60;
 
     // Calculate dialog height based on contents
-    // 1 single-line field + 1 combo field + 1 checkbox + buttons
+    // 1 single-line field + validation row + 1 combo field + 1 checkbox + buttons
     const short DLG_HEIGHT = MARGIN_Y
         + (LABEL_H + LABEL_GAP + EDIT_H + SPACING)      // API URL
+        + (LABEL_H + SPACING)                            // API Valid status row
         + (LABEL_H + LABEL_GAP + EDIT_H + SPACING)      // Interval (combo visible height = EDIT_H)
         + (EDIT_H + SPACING)                             // Checkbox
         + BTN_H + MARGIN_Y;                              // Buttons + bottom margin
@@ -674,7 +925,7 @@ void ShowConfigDialog(HWND hwndParent) {
     DLGTEMPLATE* dlgTemplate = (DLGTEMPLATE*)ptr;
     dlgTemplate->style = DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_SETFONT;
     dlgTemplate->dwExtendedStyle = 0;
-    dlgTemplate->cdit = 7;  // 2 labels + 1 edit + 1 combo + 1 checkbox + 2 buttons
+    dlgTemplate->cdit = 9;  // 2 labels + 1 edit + 2 valid statics + 1 combo + 1 checkbox + 2 buttons
     dlgTemplate->x = 0;
     dlgTemplate->y = 0;
     dlgTemplate->cx = DLG_WIDTH;
@@ -715,6 +966,15 @@ void ShowConfigDialog(HWND hwndParent) {
                            WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
                            MARGIN_X, yPos, editW, EDIT_H, L"");
     yPos += EDIT_H + SPACING;
+
+    // API Valid label
+    ptr = AddDialogControl(ptr, IDC_STATIC_VALID_LABEL, 0x0082, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                           MARGIN_X, yPos, 38, LABEL_H, L"API Valid:");
+
+    // API Valid status
+    ptr = AddDialogControl(ptr, IDC_STATIC_VALID_STATUS, 0x0082, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                           MARGIN_X + 40, yPos, 60, LABEL_H, L"");
+    yPos += LABEL_H + SPACING;
 
     // Interval label
     ptr = AddDialogControl(ptr, IDC_STATIC_INTERVAL, 0x0082, WS_CHILD | WS_VISIBLE | SS_LEFT,
