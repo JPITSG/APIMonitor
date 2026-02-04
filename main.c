@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <commctrl.h>
 #include "resource.h"
 
 #pragma comment(lib, "winhttp.lib")
@@ -19,6 +20,7 @@
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_REFRESH 1002
 #define ID_TRAY_CONFIGURE 1004
+#define ID_TRAY_HISTORY 1005
 
 // Registry settings
 #define REG_KEY_PATH        "SOFTWARE\\JPIT\\APIMonitor"
@@ -26,6 +28,7 @@
 #define REG_VALUE_INTERVAL  "RefreshInterval"
 #define REG_VALUE_LOGGING   "LoggingEnabled"
 #define REG_VALUE_CONFIGURED "Configured"
+#define REG_VALUE_HISTORY_LIMIT "HistoryLimit"
 
 // Dialog control IDs
 #define IDC_EDIT_URL        2101
@@ -37,6 +40,10 @@
 #define IDC_STATIC_VALID_STATUS 2107
 #define IDT_VALIDATE_DEBOUNCE   3001
 #define WM_VALIDATE_RESULT      (WM_APP + 1)
+#define IDC_EDIT_HISTORY_LIMIT  2108
+#define IDC_STATIC_HISTORY      2109
+#define IDC_HISTORY_LIST        2110
+#define IDC_HISTORY_CLOSE       2111
 
 typedef enum {
     RESULT_ERROR,        // Connection/network error
@@ -54,6 +61,14 @@ typedef struct {
     int attempt;
     int maxAttempts;
 } ThreadParams;
+
+typedef struct {
+    SYSTEMTIME timestamp;
+    ApiResult oldResult;
+    ApiResult newResult;
+    char oldMessage[256];
+    char newMessage[256];
+} HistoryEntry;
 
 // Global variables
 static NOTIFYICONDATA nid = {0};
@@ -77,6 +92,11 @@ static HINSTANCE g_hInstance = NULL;
 static HANDLE g_hMutex = NULL;  // Mutex for single instance check
 static CRITICAL_SECTION logCriticalSection;  // For thread-safe logging
 static BOOL configLoggingEnabled = TRUE; // Global variable for logging toggle (default true)
+static int configHistoryLimit = 100;
+static HistoryEntry* historyBuffer = NULL;
+static int historyCapacity = 0;
+static int historyCount = 0;
+static int historyHead = 0;
 
 // URL validation thread params
 typedef struct {
@@ -120,6 +140,12 @@ void RefreshTrayIconForNewResolution();
 void LogMessage(const char* format, ...);
 void CheckLogFileSize();
 DWORD WINAPI ValidateUrlThread(LPVOID param);
+const char* ApiResultToString(ApiResult r);
+void InitHistoryBuffer(int capacity);
+void AddHistoryEntry(ApiResult oldResult, const char* oldMsg, ApiResult newResult, const char* newMsg);
+HistoryEntry* GetHistoryEntry(int displayIndex);
+void FreeHistoryBuffer(void);
+void ShowHistoryDialog(HWND hwndParent);
 
 // Logging function: writes to ProgramData\APIMonitor.log with timestamp and thread ID
 void LogMessage(const char* format, ...) {
@@ -233,8 +259,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         LogMessage("Migrated configuration from INI to registry.");
     }
 
-    LogMessage("Configuration loaded: URL=%s, Interval=%d, Logging=%s",
-               configApiUrl, configRefreshInterval, configLoggingEnabled ? "enabled" : "disabled");
+    LogMessage("Configuration loaded: URL=%s, Interval=%d, Logging=%s, HistoryLimit=%d",
+               configApiUrl, configRefreshInterval, configLoggingEnabled ? "enabled" : "disabled", configHistoryLimit);
+
+    // Initialize history buffer
+    InitHistoryBuffer(configHistoryLimit);
 
     // On first launch, show configuration dialog
     if (firstLaunch) {
@@ -364,6 +393,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     LogMessage("User selected Configure from context menu.");
                     ShowConfigDialog(g_hwnd);
                     break;
+                case ID_TRAY_HISTORY:
+                    LogMessage("User selected History from context menu.");
+                    ShowHistoryDialog(g_hwnd);
+                    break;
             }
             break;
 
@@ -398,6 +431,7 @@ void InitTrayIcon(HWND hwnd) {
 void CreateContextMenu() {
     hMenu = CreatePopupMenu();
     AppendMenuA(hMenu, MF_STRING, ID_TRAY_REFRESH, "Refresh");
+    AppendMenuA(hMenu, MF_STRING, ID_TRAY_HISTORY, "History");
     AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hMenu, MF_STRING, ID_TRAY_CONFIGURE, "Configure");
     AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
@@ -439,6 +473,16 @@ BOOL LoadConfigFromRegistry() {
         configLoggingEnabled = (BOOL)dwLogging;
     }
 
+    // Read HistoryLimit (REG_DWORD)
+    DWORD dwHistoryLimit = 100;
+    size = sizeof(dwHistoryLimit);
+    if (RegQueryValueExA(hKey, REG_VALUE_HISTORY_LIMIT, NULL, &type, (LPBYTE)&dwHistoryLimit, &size) == ERROR_SUCCESS
+        && type == REG_DWORD) {
+        configHistoryLimit = (int)dwHistoryLimit;
+        if (configHistoryLimit < 10) configHistoryLimit = 10;
+        if (configHistoryLimit > 10000) configHistoryLimit = 10000;
+    }
+
     RegCloseKey(hKey);
     return TRUE;
 }
@@ -467,9 +511,14 @@ void SaveConfigToRegistry() {
     RegSetValueExA(hKey, REG_VALUE_LOGGING, 0, REG_DWORD,
                    (const BYTE*)&dwLogging, sizeof(dwLogging));
 
+    // Write HistoryLimit (REG_DWORD)
+    DWORD dwHistoryLimit = (DWORD)configHistoryLimit;
+    RegSetValueExA(hKey, REG_VALUE_HISTORY_LIMIT, 0, REG_DWORD,
+                   (const BYTE*)&dwHistoryLimit, sizeof(dwHistoryLimit));
+
     RegCloseKey(hKey);
-    LogMessage("Configuration saved to registry: URL=%s, Interval=%d, Logging=%s",
-               configApiUrl, configRefreshInterval, configLoggingEnabled ? "enabled" : "disabled");
+    LogMessage("Configuration saved to registry: URL=%s, Interval=%d, Logging=%s, HistoryLimit=%d",
+               configApiUrl, configRefreshInterval, configLoggingEnabled ? "enabled" : "disabled", configHistoryLimit);
 }
 
 BOOL IsFirstLaunch() {
@@ -513,6 +562,80 @@ void LoadConfigFromIni(const char* iniPath) {
                             configApiUrl, sizeof(configApiUrl), iniPath);
     configRefreshInterval = GetPrivateProfileIntA("General", "RefreshInterval", 60, iniPath);
     configLoggingEnabled = (BOOL)GetPrivateProfileIntA("General", "LoggingEnabled", 1, iniPath);
+}
+
+// --- History ring buffer ---
+
+const char* ApiResultToString(ApiResult r) {
+    switch (r) {
+        case RESULT_SUCCESS: return "Success";
+        case RESULT_FAIL:    return "Fail";
+        case RESULT_ERROR:   return "Error";
+        case RESULT_INVALID: return "Invalid";
+        default:             return "Unknown";
+    }
+}
+
+void InitHistoryBuffer(int capacity) {
+    if (capacity < 10) capacity = 10;
+    if (capacity > 10000) capacity = 10000;
+
+    if (historyBuffer && capacity == historyCapacity) return;
+
+    HistoryEntry* newBuf = (HistoryEntry*)calloc(capacity, sizeof(HistoryEntry));
+    if (!newBuf) return;
+
+    // Preserve most recent entries on resize
+    if (historyBuffer && historyCount > 0) {
+        int toCopy = historyCount < capacity ? historyCount : capacity;
+        for (int i = 0; i < toCopy; i++) {
+            // GetHistoryEntry(0) = most recent, so copy in reverse display order
+            HistoryEntry* src = GetHistoryEntry(i);
+            if (src) {
+                newBuf[(toCopy - 1 - i) % capacity] = *src;
+            }
+        }
+        historyHead = toCopy % capacity;
+        historyCount = toCopy;
+    } else {
+        historyHead = 0;
+        historyCount = 0;
+    }
+
+    free(historyBuffer);
+    historyBuffer = newBuf;
+    historyCapacity = capacity;
+}
+
+void AddHistoryEntry(ApiResult oldResult, const char* oldMsg, ApiResult newResult, const char* newMsg) {
+    if (!historyBuffer || historyCapacity <= 0) return;
+
+    HistoryEntry* entry = &historyBuffer[historyHead];
+    GetLocalTime(&entry->timestamp);
+    entry->oldResult = oldResult;
+    entry->newResult = newResult;
+    strncpy(entry->oldMessage, oldMsg ? oldMsg : "", sizeof(entry->oldMessage) - 1);
+    entry->oldMessage[sizeof(entry->oldMessage) - 1] = '\0';
+    strncpy(entry->newMessage, newMsg ? newMsg : "", sizeof(entry->newMessage) - 1);
+    entry->newMessage[sizeof(entry->newMessage) - 1] = '\0';
+
+    historyHead = (historyHead + 1) % historyCapacity;
+    if (historyCount < historyCapacity) historyCount++;
+}
+
+HistoryEntry* GetHistoryEntry(int displayIndex) {
+    if (!historyBuffer || displayIndex < 0 || displayIndex >= historyCount) return NULL;
+    // displayIndex 0 = most recent
+    int bufIdx = (historyHead - 1 - displayIndex + historyCapacity) % historyCapacity;
+    return &historyBuffer[bufIdx];
+}
+
+void FreeHistoryBuffer(void) {
+    free(historyBuffer);
+    historyBuffer = NULL;
+    historyCapacity = 0;
+    historyCount = 0;
+    historyHead = 0;
 }
 
 void ApplyConfiguration() {
@@ -602,6 +725,9 @@ static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT message, WPARAM wParam,
             // Set logging checkbox
             CheckDlgButton(hDlg, IDC_CHECK_LOGGING, configLoggingEnabled ? BST_CHECKED : BST_UNCHECKED);
 
+            // Set history limit
+            SetDlgItemInt(hDlg, IDC_EDIT_HISTORY_LIMIT, (UINT)configHistoryLimit, FALSE);
+
             // Center dialog on screen
             RECT rcDlg, rcScreen;
             GetWindowRect(hDlg, &rcDlg);
@@ -677,6 +803,18 @@ static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT message, WPARAM wParam,
 
                     // Get logging
                     configLoggingEnabled = (IsDlgButtonChecked(hDlg, IDC_CHECK_LOGGING) == BST_CHECKED);
+
+                    // Get history limit
+                    {
+                        BOOL translated = FALSE;
+                        UINT hlVal = GetDlgItemInt(hDlg, IDC_EDIT_HISTORY_LIMIT, &translated, FALSE);
+                        if (translated) {
+                            if (hlVal < 10) hlVal = 10;
+                            if (hlVal > 10000) hlVal = 10000;
+                            configHistoryLimit = (int)hlVal;
+                            InitHistoryBuffer(configHistoryLimit);
+                        }
+                    }
 
                     SaveConfigToRegistry();
                     MarkAsConfigured();
@@ -903,12 +1041,13 @@ void ShowConfigDialog(HWND hwndParent) {
     const short COMBO_DROPDOWN = 60;
 
     // Calculate dialog height based on contents
-    // 1 single-line field + validation row + 1 combo field + 1 checkbox + buttons
+    // 1 single-line field + validation row + 1 combo field + 1 checkbox + 1 history limit field + buttons
     const short DLG_HEIGHT = MARGIN_Y
         + (LABEL_H + LABEL_GAP + EDIT_H + SPACING)      // API URL
         + (LABEL_H + SPACING)                            // API Valid status row
         + (LABEL_H + LABEL_GAP + EDIT_H + SPACING)      // Interval (combo visible height = EDIT_H)
         + (EDIT_H + SPACING)                             // Checkbox
+        + (LABEL_H + LABEL_GAP + EDIT_H + SPACING)      // History Limit
         + BTN_H + MARGIN_Y;                              // Buttons + bottom margin
 
     short editW = DLG_WIDTH - (2 * MARGIN_X);
@@ -925,7 +1064,7 @@ void ShowConfigDialog(HWND hwndParent) {
     DLGTEMPLATE* dlgTemplate = (DLGTEMPLATE*)ptr;
     dlgTemplate->style = DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_SETFONT;
     dlgTemplate->dwExtendedStyle = 0;
-    dlgTemplate->cdit = 9;  // 2 labels + 1 edit + 2 valid statics + 1 combo + 1 checkbox + 2 buttons
+    dlgTemplate->cdit = 11;  // 2 labels + 1 edit + 2 valid statics + 1 combo + 1 checkbox + 1 history label + 1 history edit + 2 buttons
     dlgTemplate->x = 0;
     dlgTemplate->y = 0;
     dlgTemplate->cx = DLG_WIDTH;
@@ -991,6 +1130,17 @@ void ShowConfigDialog(HWND hwndParent) {
     ptr = AddDialogControl(ptr, IDC_CHECK_LOGGING, 0x0080,
                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                            MARGIN_X, yPos, editW, EDIT_H, L"Enable Logging");
+    yPos += EDIT_H + SPACING;
+
+    // History Limit label
+    ptr = AddDialogControl(ptr, IDC_STATIC_HISTORY, 0x0082, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                           MARGIN_X, yPos, editW, LABEL_H, L"History Limit (10-10000):");
+    yPos += LABEL_H + LABEL_GAP;
+
+    // History Limit edit
+    ptr = AddDialogControl(ptr, IDC_EDIT_HISTORY_LIMIT, 0x0081,
+                           WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_NUMBER,
+                           MARGIN_X, yPos, 80, EDIT_H, L"");
     yPos += EDIT_H + SPACING;
 
     // OK button
@@ -1370,6 +1520,13 @@ DWORD WINAPI RefreshThread(LPVOID param) {
 }
 
 void UpdateStatus(ApiResult result, const char* message) {
+    // Detect status changes and record in history
+    BOOL resultChanged = (result != currentResult);
+    BOOL messageChanged = (message && strcmp(currentMessage, message) != 0);
+    if (resultChanged || (messageChanged && result != RESULT_SUCCESS)) {
+        AddHistoryEntry(currentResult, currentMessage, result, message ? message : "");
+    }
+
     currentResult = result;
     if (message) {
         strncpy(currentMessage, message, sizeof(currentMessage) - 1);
@@ -1544,11 +1701,193 @@ void RefreshTrayIconForNewResolution() {
     UpdateTooltip();
 }
 
+// --- History dialog ---
+
+static INT_PTR CALLBACK HistoryDialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
+    UNREFERENCED_PARAMETER(lParam);
+
+    switch (message) {
+        case WM_INITDIALOG: {
+            // Center dialog on screen
+            RECT rcDlg, rcScreen;
+            GetWindowRect(hDlg, &rcDlg);
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &rcScreen, 0);
+            int x = rcScreen.left + ((rcScreen.right - rcScreen.left) - (rcDlg.right - rcDlg.left)) / 2;
+            int y = rcScreen.top + ((rcScreen.bottom - rcScreen.top) - (rcDlg.bottom - rcDlg.top)) / 2;
+            SetWindowPos(hDlg, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+
+            // Get the placeholder static control position and replace with ListView
+            HWND hPlaceholder = GetDlgItem(hDlg, IDC_HISTORY_LIST);
+            RECT rcList;
+            GetWindowRect(hPlaceholder, &rcList);
+            MapWindowPoints(HWND_DESKTOP, hDlg, (LPPOINT)&rcList, 2);
+            ShowWindow(hPlaceholder, SW_HIDE);
+
+            // Initialize common controls
+            INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES };
+            InitCommonControlsEx(&icc);
+
+            // Create ListView
+            HWND hList = CreateWindowExA(0, WC_LISTVIEWA, "",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER,
+                rcList.left, rcList.top,
+                rcList.right - rcList.left, rcList.bottom - rcList.top,
+                hDlg, (HMENU)(UINT_PTR)IDC_HISTORY_LIST, g_hInstance, NULL);
+
+            SendMessageA(hList, LVM_SETEXTENDEDLISTVIEWSTYLE, 0,
+                         LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+
+            // Add columns
+            LVCOLUMNA col = {0};
+            col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
+            col.fmt = LVCFMT_LEFT;
+
+            col.pszText = "Time";
+            col.cx = 130;
+            SendMessageA(hList, LVM_INSERTCOLUMNA, 0, (LPARAM)&col);
+
+            col.pszText = "From";
+            col.cx = 70;
+            SendMessageA(hList, LVM_INSERTCOLUMNA, 1, (LPARAM)&col);
+
+            col.pszText = "To";
+            col.cx = 70;
+            SendMessageA(hList, LVM_INSERTCOLUMNA, 2, (LPARAM)&col);
+
+            col.pszText = "Message";
+            col.cx = 200;
+            SendMessageA(hList, LVM_INSERTCOLUMNA, 3, (LPARAM)&col);
+
+            // Populate from ring buffer, most recent first
+            if (historyCount == 0) {
+                LVITEMA item = {0};
+                item.mask = LVIF_TEXT;
+                item.iItem = 0;
+                item.iSubItem = 0;
+                item.pszText = "No status changes recorded yet.";
+                SendMessageA(hList, LVM_INSERTITEMA, 0, (LPARAM)&item);
+            } else {
+                for (int i = 0; i < historyCount; i++) {
+                    HistoryEntry* entry = GetHistoryEntry(i);
+                    if (!entry) continue;
+
+                    char timeBuf[64];
+                    sprintf(timeBuf, "%04d-%02d-%02d %02d:%02d:%02d",
+                            entry->timestamp.wYear, entry->timestamp.wMonth, entry->timestamp.wDay,
+                            entry->timestamp.wHour, entry->timestamp.wMinute, entry->timestamp.wSecond);
+
+                    LVITEMA item = {0};
+                    item.mask = LVIF_TEXT;
+                    item.iItem = i;
+                    item.iSubItem = 0;
+                    item.pszText = timeBuf;
+                    SendMessageA(hList, LVM_INSERTITEMA, 0, (LPARAM)&item);
+
+                    item.iSubItem = 1;
+                    item.pszText = (char*)ApiResultToString(entry->oldResult);
+                    SendMessageA(hList, LVM_SETITEMA, 0, (LPARAM)&item);
+
+                    item.iSubItem = 2;
+                    item.pszText = (char*)ApiResultToString(entry->newResult);
+                    SendMessageA(hList, LVM_SETITEMA, 0, (LPARAM)&item);
+
+                    item.iSubItem = 3;
+                    item.pszText = entry->newMessage;
+                    SendMessageA(hList, LVM_SETITEMA, 0, (LPARAM)&item);
+                }
+            }
+
+            return TRUE;
+        }
+
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDC_HISTORY_CLOSE || LOWORD(wParam) == IDCANCEL) {
+                EndDialog(hDlg, 0);
+                return TRUE;
+            }
+            break;
+
+        case WM_CLOSE:
+            EndDialog(hDlg, 0);
+            return TRUE;
+    }
+    return FALSE;
+}
+
+void ShowHistoryDialog(HWND hwndParent) {
+    const short DLG_WIDTH = 520;
+    const short DLG_HEIGHT = 320;
+    const short MARGIN_X = 8;
+    const short MARGIN_Y = 8;
+    const short BTN_W = 50;
+    const short BTN_H = 14;
+
+    size_t templateSize = 4096;
+    BYTE* templateBuffer = (BYTE*)calloc(1, templateSize);
+    if (!templateBuffer) return;
+
+    BYTE* ptr = templateBuffer;
+
+    // DLGTEMPLATE
+    DLGTEMPLATE* dlgTemplate = (DLGTEMPLATE*)ptr;
+    dlgTemplate->style = DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_SETFONT;
+    dlgTemplate->dwExtendedStyle = 0;
+    dlgTemplate->cdit = 2;  // placeholder static + close button
+    dlgTemplate->x = 0;
+    dlgTemplate->y = 0;
+    dlgTemplate->cx = DLG_WIDTH;
+    dlgTemplate->cy = DLG_HEIGHT;
+    ptr += sizeof(DLGTEMPLATE);
+
+    // Menu (none)
+    *(WORD*)ptr = 0;
+    ptr += sizeof(WORD);
+
+    // Class (default)
+    *(WORD*)ptr = 0;
+    ptr += sizeof(WORD);
+
+    // Title
+    const wchar_t* title = L"Status Change History";
+    size_t titleLen = wcslen(title) + 1;
+    memcpy(ptr, title, titleLen * sizeof(wchar_t));
+    ptr += titleLen * sizeof(wchar_t);
+
+    // Font size
+    *(WORD*)ptr = 8;
+    ptr += sizeof(WORD);
+
+    // Font name
+    const wchar_t* fontName = L"Segoe UI";
+    size_t fontLen = wcslen(fontName) + 1;
+    memcpy(ptr, fontName, fontLen * sizeof(wchar_t));
+    ptr += fontLen * sizeof(wchar_t);
+
+    // Placeholder static for ListView (will be replaced in WM_INITDIALOG)
+    short listH = DLG_HEIGHT - MARGIN_Y - MARGIN_Y - BTN_H - 6;
+    short listW = DLG_WIDTH - (2 * MARGIN_X);
+    ptr = AddDialogControl(ptr, IDC_HISTORY_LIST, 0x0082, WS_CHILD | WS_VISIBLE,
+                           MARGIN_X, MARGIN_Y, listW, listH, L"");
+
+    // Close button
+    short btnY = MARGIN_Y + listH + 4;
+    short btnX = (DLG_WIDTH - BTN_W) / 2;
+    ptr = AddDialogControl(ptr, IDC_HISTORY_CLOSE, 0x0080,
+                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                           btnX, btnY, BTN_W, BTN_H, L"Close");
+
+    DialogBoxIndirectParamW(g_hInstance, (DLGTEMPLATE*)templateBuffer,
+                            hwndParent, HistoryDialogProc, 0);
+    free(templateBuffer);
+}
+
 void ExitApplication(HWND hwnd) {
     LogMessage("=== Application shutting down ===");
 
     if (timerRefresh) KillTimer(hwnd, 1);
     if (timerTooltip) KillTimer(hwnd, 2);
+
+    FreeHistoryBuffer();
 
     Shell_NotifyIconA(NIM_DELETE, &nid);
 

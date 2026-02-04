@@ -16,7 +16,7 @@ ICON_SIZES = 16 24 32 48 256
 
 CFLAGS = -O2 -mwindows -I.
 LDFLAGS = -mwindows
-LIBS = -lwinhttp -lshell32 -luser32 -lgdi32 -ladvapi32
+LIBS = -lwinhttp -lshell32 -luser32 -lgdi32 -ladvapi32 -lcomctl32
 
 .PHONY: all clean icons
 
