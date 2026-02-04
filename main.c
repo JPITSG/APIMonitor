@@ -29,6 +29,8 @@
 #define REG_VALUE_LOGGING   "LoggingEnabled"
 #define REG_VALUE_CONFIGURED "Configured"
 #define REG_VALUE_HISTORY_LIMIT "HistoryLimit"
+#define REG_VALUE_HISTORY_COUNT "HistoryCount"
+#define REG_VALUE_HISTORY_DATA  "HistoryData"
 
 // Dialog control IDs
 #define IDC_EDIT_URL        2101
@@ -146,6 +148,8 @@ void AddHistoryEntry(ApiResult oldResult, const char* oldMsg, ApiResult newResul
 HistoryEntry* GetHistoryEntry(int displayIndex);
 void FreeHistoryBuffer(void);
 void ShowHistoryDialog(HWND hwndParent);
+void SaveHistoryToRegistry(void);
+void LoadHistoryFromRegistry(void);
 
 // Logging function: writes to ProgramData\APIMonitor.log with timestamp and thread ID
 void LogMessage(const char* format, ...) {
@@ -264,6 +268,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Initialize history buffer
     InitHistoryBuffer(configHistoryLimit);
+    LoadHistoryFromRegistry();
 
     // On first launch, show configuration dialog
     if (firstLaunch) {
@@ -636,6 +641,115 @@ void FreeHistoryBuffer(void) {
     historyCapacity = 0;
     historyCount = 0;
     historyHead = 0;
+}
+
+void SaveHistoryToRegistry(void) {
+    HKEY hKey;
+    DWORD disposition;
+    LONG result = RegCreateKeyExA(HKEY_CURRENT_USER, REG_KEY_PATH, 0, NULL,
+                                  REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, &disposition);
+    if (result != ERROR_SUCCESS) {
+        LogMessage("ERROR: Failed to open registry for history save. Error: %lu", result);
+        return;
+    }
+
+    if (historyCount == 0 || !historyBuffer) {
+        DWORD zero = 0;
+        RegSetValueExA(hKey, REG_VALUE_HISTORY_COUNT, 0, REG_DWORD,
+                       (const BYTE*)&zero, sizeof(zero));
+        RegDeleteValueA(hKey, REG_VALUE_HISTORY_DATA);
+        RegCloseKey(hKey);
+        LogMessage("History saved to registry: 0 entries.");
+        return;
+    }
+
+    // Serialize most-recent-first
+    DWORD dataSize = (DWORD)(historyCount * sizeof(HistoryEntry));
+    BYTE* data = (BYTE*)malloc(dataSize);
+    if (!data) {
+        RegCloseKey(hKey);
+        return;
+    }
+
+    for (int i = 0; i < historyCount; i++) {
+        HistoryEntry* entry = GetHistoryEntry(i); // 0 = most recent
+        if (entry) {
+            memcpy(data + i * sizeof(HistoryEntry), entry, sizeof(HistoryEntry));
+        }
+    }
+
+    DWORD dwCount = (DWORD)historyCount;
+    RegSetValueExA(hKey, REG_VALUE_HISTORY_COUNT, 0, REG_DWORD,
+                   (const BYTE*)&dwCount, sizeof(dwCount));
+    RegSetValueExA(hKey, REG_VALUE_HISTORY_DATA, 0, REG_BINARY,
+                   data, dataSize);
+
+    free(data);
+    RegCloseKey(hKey);
+    LogMessage("History saved to registry: %d entries.", historyCount);
+}
+
+void LoadHistoryFromRegistry(void) {
+    HKEY hKey;
+    LONG result = RegOpenKeyExA(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey);
+    if (result != ERROR_SUCCESS) return;
+
+    DWORD type, size;
+
+    // Read count
+    DWORD dwCount = 0;
+    size = sizeof(dwCount);
+    if (RegQueryValueExA(hKey, REG_VALUE_HISTORY_COUNT, NULL, &type, (LPBYTE)&dwCount, &size) != ERROR_SUCCESS
+        || type != REG_DWORD || dwCount == 0) {
+        RegCloseKey(hKey);
+        return;
+    }
+
+    // Read data size first
+    size = 0;
+    if (RegQueryValueExA(hKey, REG_VALUE_HISTORY_DATA, NULL, &type, NULL, &size) != ERROR_SUCCESS
+        || type != REG_BINARY) {
+        RegCloseKey(hKey);
+        return;
+    }
+
+    // Validate size matches count
+    if (size != dwCount * sizeof(HistoryEntry)) {
+        LogMessage("WARNING: History data size mismatch (expected %lu, got %lu). Discarding.",
+                   (unsigned long)(dwCount * sizeof(HistoryEntry)), (unsigned long)size);
+        RegCloseKey(hKey);
+        return;
+    }
+
+    BYTE* data = (BYTE*)malloc(size);
+    if (!data) {
+        RegCloseKey(hKey);
+        return;
+    }
+
+    if (RegQueryValueExA(hKey, REG_VALUE_HISTORY_DATA, NULL, &type, data, &size) != ERROR_SUCCESS) {
+        free(data);
+        RegCloseKey(hKey);
+        return;
+    }
+
+    RegCloseKey(hKey);
+
+    // Cap to current buffer capacity
+    int toLoad = (int)dwCount;
+    if (toLoad > historyCapacity) toLoad = historyCapacity;
+
+    // Data is stored most-recent-first; insert oldest-first so ring buffer order is correct
+    for (int i = toLoad - 1; i >= 0; i--) {
+        HistoryEntry* src = (HistoryEntry*)(data + i * sizeof(HistoryEntry));
+        HistoryEntry* dst = &historyBuffer[historyHead];
+        *dst = *src;
+        historyHead = (historyHead + 1) % historyCapacity;
+        if (historyCount < historyCapacity) historyCount++;
+    }
+
+    free(data);
+    LogMessage("History loaded from registry: %d entries.", toLoad);
 }
 
 void ApplyConfiguration() {
@@ -1797,6 +1911,9 @@ static INT_PTR CALLBACK HistoryDialogProc(HWND hDlg, UINT message, WPARAM wParam
                 }
             }
 
+            // Auto-size Message column to fill remaining space
+            SendMessageA(hList, LVM_SETCOLUMNWIDTH, 3, LVSCW_AUTOSIZE_USEHEADER);
+
             return TRUE;
         }
 
@@ -1887,6 +2004,7 @@ void ExitApplication(HWND hwnd) {
     if (timerRefresh) KillTimer(hwnd, 1);
     if (timerTooltip) KillTimer(hwnd, 2);
 
+    SaveHistoryToRegistry();
     FreeHistoryBuffer();
 
     Shell_NotifyIconA(NIM_DELETE, &nid);
