@@ -48,6 +48,7 @@
 #define IDC_HISTORY_CLOSE       2111
 
 typedef enum {
+    RESULT_NONE,         // Initial state - no result yet
     RESULT_ERROR,        // Connection/network error
     RESULT_INVALID,      // Connected but invalid response
     RESULT_SUCCESS,
@@ -87,7 +88,7 @@ static UINT_PTR timerTooltip = 0;
 static BOOL iconVisible = TRUE;
 static HICON currentIcon = NULL;
 static char currentMessage[256] = "";
-static ApiResult currentResult = RESULT_ERROR;
+static ApiResult currentResult = RESULT_NONE;
 static SYSTEMTIME lastUpdateTime = {0};
 static HWND g_hwnd = NULL;
 static HINSTANCE g_hInstance = NULL;
@@ -573,6 +574,7 @@ void LoadConfigFromIni(const char* iniPath) {
 
 const char* ApiResultToString(ApiResult r) {
     switch (r) {
+        case RESULT_NONE:    return "-";
         case RESULT_SUCCESS: return "Success";
         case RESULT_FAIL:    return "Fail";
         case RESULT_ERROR:   return "Error";
@@ -1634,10 +1636,10 @@ DWORD WINAPI RefreshThread(LPVOID param) {
 }
 
 void UpdateStatus(ApiResult result, const char* message) {
-    // Detect status changes and record in history
+    // Detect status changes and record in history (skip if this is the first result)
     BOOL resultChanged = (result != currentResult);
     BOOL messageChanged = (message && strcmp(currentMessage, message) != 0);
-    if (resultChanged || (messageChanged && result != RESULT_SUCCESS)) {
+    if (currentResult != RESULT_NONE && (resultChanged || (messageChanged && result != RESULT_SUCCESS))) {
         AddHistoryEntry(currentResult, currentMessage, result, message ? message : "");
     }
 
@@ -1999,6 +2001,10 @@ void ShowHistoryDialog(HWND hwndParent) {
 }
 
 void ExitApplication(HWND hwnd) {
+    static BOOL alreadyExiting = FALSE;
+    if (alreadyExiting) return;
+    alreadyExiting = TRUE;
+
     LogMessage("=== Application shutting down ===");
 
     if (timerRefresh) KillTimer(hwnd, 1);
