@@ -46,6 +46,7 @@
 #define IDC_STATIC_HISTORY      2109
 #define IDC_HISTORY_LIST        2110
 #define IDC_HISTORY_CLOSE       2111
+#define IDC_HISTORY_CLEAR       2112
 
 typedef enum {
     RESULT_NONE,         // Initial state - no result yet
@@ -1837,7 +1838,7 @@ static INT_PTR CALLBACK HistoryDialogProc(HWND hDlg, UINT message, WPARAM wParam
             RECT rcList;
             GetWindowRect(hPlaceholder, &rcList);
             MapWindowPoints(HWND_DESKTOP, hDlg, (LPPOINT)&rcList, 2);
-            ShowWindow(hPlaceholder, SW_HIDE);
+            DestroyWindow(hPlaceholder);
 
             // Initialize common controls
             INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES };
@@ -1924,6 +1925,22 @@ static INT_PTR CALLBACK HistoryDialogProc(HWND hDlg, UINT message, WPARAM wParam
                 EndDialog(hDlg, 0);
                 return TRUE;
             }
+            if (LOWORD(wParam) == IDC_HISTORY_CLEAR) {
+                // Clear the history
+                historyCount = 0;
+                historyHead = 0;
+                // Update the list view
+                HWND hList = GetDlgItem(hDlg, IDC_HISTORY_LIST);
+                SendMessageA(hList, LVM_DELETEALLITEMS, 0, 0);
+                // Show empty message
+                LVITEMA item = {0};
+                item.mask = LVIF_TEXT;
+                item.iItem = 0;
+                item.iSubItem = 0;
+                item.pszText = "No status changes recorded yet.";
+                SendMessageA(hList, LVM_INSERTITEMA, 0, (LPARAM)&item);
+                return TRUE;
+            }
             break;
 
         case WM_CLOSE:
@@ -1951,7 +1968,7 @@ void ShowHistoryDialog(HWND hwndParent) {
     DLGTEMPLATE* dlgTemplate = (DLGTEMPLATE*)ptr;
     dlgTemplate->style = DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_SETFONT;
     dlgTemplate->dwExtendedStyle = 0;
-    dlgTemplate->cdit = 2;  // placeholder static + close button
+    dlgTemplate->cdit = 3;  // placeholder static + clear button + close button
     dlgTemplate->x = 0;
     dlgTemplate->y = 0;
     dlgTemplate->cx = DLG_WIDTH;
@@ -1988,12 +2005,17 @@ void ShowHistoryDialog(HWND hwndParent) {
     ptr = AddDialogControl(ptr, IDC_HISTORY_LIST, 0x0082, WS_CHILD | WS_VISIBLE,
                            MARGIN_X, MARGIN_Y, listW, listH, L"");
 
-    // Close button
+    // Clear and Close buttons
     short btnY = MARGIN_Y + listH + 4;
-    short btnX = (DLG_WIDTH - BTN_W) / 2;
+    short btnGap = 8;
+    short totalBtnW = BTN_W + btnGap + BTN_W;
+    short btnX = (DLG_WIDTH - totalBtnW) / 2;
+    ptr = AddDialogControl(ptr, IDC_HISTORY_CLEAR, 0x0080,
+                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                           btnX, btnY, BTN_W, BTN_H, L"Clear");
     ptr = AddDialogControl(ptr, IDC_HISTORY_CLOSE, 0x0080,
                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                           btnX, btnY, BTN_W, BTN_H, L"Close");
+                           btnX + BTN_W + btnGap, btnY, BTN_W, BTN_H, L"Close");
 
     DialogBoxIndirectParamW(g_hInstance, (DLGTEMPLATE*)templateBuffer,
                             hwndParent, HistoryDialogProc, 0);
