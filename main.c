@@ -1914,8 +1914,30 @@ static INT_PTR CALLBACK HistoryDialogProc(HWND hDlg, UINT message, WPARAM wParam
                 }
             }
 
-            // Auto-size Message column to fill remaining space
-            SendMessageA(hList, LVM_SETCOLUMNWIDTH, 3, LVSCW_AUTOSIZE_USEHEADER);
+            // Auto-size Time, From, To to fit content
+            SendMessageA(hList, LVM_SETCOLUMNWIDTH, 0, LVSCW_AUTOSIZE_USEHEADER);
+            SendMessageA(hList, LVM_SETCOLUMNWIDTH, 1, LVSCW_AUTOSIZE_USEHEADER);
+            SendMessageA(hList, LVM_SETCOLUMNWIDTH, 2, LVSCW_AUTOSIZE_USEHEADER);
+
+            // Add uniform padding to the first 3 columns
+            int pad = 8;
+            for (int c = 0; c < 3; c++) {
+                int w = (int)SendMessageA(hList, LVM_GETCOLUMNWIDTH, c, 0);
+                SendMessageA(hList, LVM_SETCOLUMNWIDTH, c, w + pad);
+            }
+
+            // Set Message column to fill remaining space exactly
+            RECT rcClient;
+            GetClientRect(hList, &rcClient);
+            int totalWidth = rcClient.right - rcClient.left;
+
+            int used = 0;
+            for (int c = 0; c < 3; c++)
+                used += (int)SendMessageA(hList, LVM_GETCOLUMNWIDTH, c, 0);
+
+            int msgWidth = totalWidth - used;
+            if (msgWidth < 50) msgWidth = 50;
+            SendMessageA(hList, LVM_SETCOLUMNWIDTH, 3, msgWidth);
 
             return TRUE;
         }
