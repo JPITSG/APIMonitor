@@ -1820,6 +1820,30 @@ void RefreshTrayIconForNewResolution() {
 
 // --- History dialog ---
 
+static LRESULT CALLBACK HeaderNoResizeProc(HWND hWnd, UINT msg, WPARAM wParam,
+                                           LPARAM lParam, UINT_PTR uIdSubclass,
+                                           DWORD_PTR dwRefData) {
+    if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK || msg == WM_SETCURSOR) {
+        HDHITTESTINFO ht = {0};
+        DWORD pos = GetMessagePos();
+        ht.pt.x = (short)LOWORD(pos);
+        ht.pt.y = (short)HIWORD(pos);
+        ScreenToClient(hWnd, &ht.pt);
+        SendMessageA(hWnd, HDM_HITTEST, 0, (LPARAM)&ht);
+        if (ht.flags & (HHT_ONDIVIDER | HHT_ONDIVOPEN)) {
+            if (msg == WM_SETCURSOR) {
+                SetCursor(LoadCursorA(NULL, IDC_ARROW));
+                return TRUE;
+            }
+            return 0;
+        }
+    }
+    if (msg == WM_NCDESTROY) {
+        RemoveWindowSubclass(hWnd, HeaderNoResizeProc, uIdSubclass);
+    }
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+}
+
 static INT_PTR CALLBACK HistoryDialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
     UNREFERENCED_PARAMETER(lParam);
 
@@ -1938,6 +1962,10 @@ static INT_PTR CALLBACK HistoryDialogProc(HWND hDlg, UINT message, WPARAM wParam
             int msgWidth = totalWidth - used;
             if (msgWidth < 50) msgWidth = 50;
             SendMessageA(hList, LVM_SETCOLUMNWIDTH, 3, msgWidth);
+
+            // Subclass header to prevent column resizing
+            HWND hHeader = (HWND)SendMessageA(hList, LVM_GETHEADER, 0, 0);
+            SetWindowSubclass(hHeader, HeaderNoResizeProc, 0, 0);
 
             return TRUE;
         }
