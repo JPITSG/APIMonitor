@@ -21,6 +21,7 @@
 #define ID_TRAY_REFRESH 1002
 #define ID_TRAY_CONFIGURE 1004
 #define ID_TRAY_HISTORY 1005
+#define ID_HISTORY_COPY 1006
 
 // Registry settings
 #define REG_KEY_PATH        "SOFTWARE\\JPIT\\APIMonitor"
@@ -1844,6 +1845,51 @@ static LRESULT CALLBACK HeaderNoResizeProc(HWND hWnd, UINT msg, WPARAM wParam,
     return DefSubclassProc(hWnd, msg, wParam, lParam);
 }
 
+static void CopySelectedHistoryRow(HWND hList) {
+    int sel = (int)SendMessageA(hList, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
+    if (sel < 0) return;
+
+    char timeBuf[128], fromBuf[64], toBuf[64], msgBuf[512];
+    LVITEMA item = {0};
+    item.mask = LVIF_TEXT;
+    item.iItem = sel;
+
+    item.iSubItem = 0;
+    item.pszText = timeBuf;
+    item.cchTextMax = sizeof(timeBuf);
+    SendMessageA(hList, LVM_GETITEMTEXTA, sel, (LPARAM)&item);
+
+    item.iSubItem = 1;
+    item.pszText = fromBuf;
+    item.cchTextMax = sizeof(fromBuf);
+    SendMessageA(hList, LVM_GETITEMTEXTA, sel, (LPARAM)&item);
+
+    item.iSubItem = 2;
+    item.pszText = toBuf;
+    item.cchTextMax = sizeof(toBuf);
+    SendMessageA(hList, LVM_GETITEMTEXTA, sel, (LPARAM)&item);
+
+    item.iSubItem = 3;
+    item.pszText = msgBuf;
+    item.cchTextMax = sizeof(msgBuf);
+    SendMessageA(hList, LVM_GETITEMTEXTA, sel, (LPARAM)&item);
+
+    char clipBuf[1024];
+    int len = sprintf(clipBuf, "%s\r\nFrom %s to %s\r\n%s", timeBuf, fromBuf, toBuf, msgBuf);
+
+    if (OpenClipboard(hList)) {
+        EmptyClipboard();
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len + 1);
+        if (hMem) {
+            char* p = (char*)GlobalLock(hMem);
+            memcpy(p, clipBuf, len + 1);
+            GlobalUnlock(hMem);
+            SetClipboardData(CF_TEXT, hMem);
+        }
+        CloseClipboard();
+    }
+}
+
 static INT_PTR CALLBACK HistoryDialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
     UNREFERENCED_PARAMETER(lParam);
 
@@ -1968,6 +2014,36 @@ static INT_PTR CALLBACK HistoryDialogProc(HWND hDlg, UINT message, WPARAM wParam
             SetWindowSubclass(hHeader, HeaderNoResizeProc, 0, 0);
 
             return TRUE;
+        }
+
+        case WM_NOTIFY: {
+            NMHDR* nmh = (NMHDR*)lParam;
+            if (nmh->idFrom == IDC_HISTORY_LIST) {
+                HWND hList = nmh->hwndFrom;
+                if (nmh->code == NM_RCLICK) {
+                    int sel = (int)SendMessageA(hList, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
+                    if (sel >= 0) {
+                        HMENU hMenu = CreatePopupMenu();
+                        AppendMenuA(hMenu, MF_STRING, ID_HISTORY_COPY, "Copy");
+                        POINT pt;
+                        GetCursorPos(&pt);
+                        int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                                 pt.x, pt.y, 0, hDlg, NULL);
+                        DestroyMenu(hMenu);
+                        if (cmd == ID_HISTORY_COPY)
+                            CopySelectedHistoryRow(hList);
+                    }
+                    return TRUE;
+                }
+                if (nmh->code == LVN_KEYDOWN) {
+                    NMLVKEYDOWN* kd = (NMLVKEYDOWN*)lParam;
+                    if (kd->wVKey == 'C' && GetKeyState(VK_CONTROL) < 0) {
+                        CopySelectedHistoryRow(hList);
+                        return TRUE;
+                    }
+                }
+            }
+            break;
         }
 
         case WM_COMMAND:
