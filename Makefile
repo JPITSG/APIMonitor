@@ -16,9 +16,9 @@ ICON_SIZES = 16 24 32 48 256
 
 CFLAGS = -O2 -mwindows -I.
 LDFLAGS = -mwindows
-LIBS = -lwinhttp -lshell32 -luser32 -lgdi32 -ladvapi32 -lcomctl32
+LIBS = -lwinhttp -lshell32 -luser32 -lgdi32 -ladvapi32 -lcomctl32 -lole32
 
-.PHONY: all clean icons
+.PHONY: all clean icons assets
 
 all: $(RELEASE_DIR)/$(TARGET)
 
@@ -33,9 +33,15 @@ main.o: $(SOURCES) resource.h
 	@echo "Compiling $(SOURCES)..."
 	$(CC) -c $< -o $@ $(CFLAGS)
 
-resources.o: $(RESOURCES) resource.h empty.ico success.ico fail.ico blank.ico
+resources.o: $(RESOURCES) resource.h empty.ico success.ico fail.ico blank.ico assets/dist/index.html assets/WebView2Loader.dll
 	@echo "Compiling resources..."
 	$(WINDRES) $< -o $@
+
+assets/dist/index.html: assets/package.json assets/src/App.tsx assets/src/ConfigView.tsx assets/src/HistoryView.tsx assets/src/lib/bridge.ts
+	@echo "Building frontend assets..."
+	cd assets && npm install && npm run build
+
+assets: assets/dist/index.html
 
 # Generate multi-sized .ico files from .svg sources using ImageMagick
 icons:
@@ -53,3 +59,4 @@ icons:
 clean:
 	rm -f $(OBJ)
 	rm -rf $(RELEASE_DIR)
+	rm -rf assets/dist assets/node_modules

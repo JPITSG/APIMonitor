@@ -8,4 +8,7 @@
 #define IDI_FAIL    103
 #define IDI_BLANK   104
 
+#define IDR_HTML_UI      200
+#define IDR_WEBVIEW2_DLL 201
+
 #endif // RESOURCE_H

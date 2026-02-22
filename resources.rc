@@ -9,3 +9,7 @@ IDI_EMPTY   ICON "empty.ico"
 IDI_SUCCESS ICON "success.ico"
 IDI_FAIL    ICON "fail.ico"
 IDI_BLANK   ICON "blank.ico"
+
+// WebView2 UI resources
+IDR_HTML_UI      RCDATA "assets/dist/index.html"
+IDR_WEBVIEW2_DLL RCDATA "assets/WebView2Loader.dll"
