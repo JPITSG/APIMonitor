@@ -3,6 +3,7 @@ export interface ConfigData {
   interval: number;
   loggingEnabled: boolean;
   historyLimit: number;
+  logPath?: string;
 }
 
 export interface ValidationResult {

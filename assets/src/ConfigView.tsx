@@ -111,7 +111,7 @@ export default function ConfigView({ config }: ConfigViewProps) {
           id="interval"
           value={interval}
           onChange={(e) => setInterval(Number(e.target.value))}
-          className="h-8 rounded-md border border-neutral-300 bg-transparent px-3 py-1 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400"
+          className="w-40 h-8 rounded-md border border-neutral-300 bg-transparent px-3 py-1 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400"
         >
           <option value={60}>Every 1 minute</option>
           <option value={120}>Every 2 minutes</option>
@@ -119,12 +119,16 @@ export default function ConfigView({ config }: ConfigViewProps) {
         </select>
       </div>
 
-      <div data-row className="flex items-center justify-between">
-        <Label htmlFor="logging">Enable Logging</Label>
+      <div data-row className="flex items-start justify-between gap-3">
+        <div className="flex flex-col">
+          <Label htmlFor="logging">Enable Debug Logging</Label>
+          <span className="text-[10px] text-neutral-500 break-all leading-tight mt-1.5">({config.logPath})</span>
+        </div>
         <Switch
           id="logging"
           checked={loggingEnabled}
           onCheckedChange={setLoggingEnabled}
+          className="shrink-0 mt-0.5"
         />
       </div>
 
@@ -137,7 +141,7 @@ export default function ConfigView({ config }: ConfigViewProps) {
           max={10000}
           value={historyLimit}
           onChange={(e) => setHistoryLimit(e.target.value)}
-          className="w-24"
+          className="w-40"
         />
       </div>
 

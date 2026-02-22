@@ -1851,12 +1851,14 @@ static const wchar_t* ApiResultToStringW(ApiResult r) {
 static void webview_push_init_config(void) {
     wchar_t wUrl[1024];
     json_escape_string(configApiUrl, wUrl, 1024);
-    wchar_t script[2048];
-    swprintf(script, 2048,
-        L"window.onInit({\"view\":\"config\",\"config\":{\"url\":\"%s\",\"interval\":%d,\"loggingEnabled\":%s,\"historyLimit\":%d}})",
+    wchar_t wLogPath[1024];
+    json_escape_string(logFilePath, wLogPath, 1024);
+    wchar_t script[4096];
+    swprintf(script, 4096,
+        L"window.onInit({\"view\":\"config\",\"config\":{\"url\":\"%s\",\"interval\":%d,\"loggingEnabled\":%s,\"historyLimit\":%d,\"logPath\":\"%s\"}})",
         wUrl, configRefreshInterval,
         configLoggingEnabled ? L"true" : L"false",
-        configHistoryLimit);
+        configHistoryLimit, wLogPath);
     webview_execute_script(script);
 }
 
