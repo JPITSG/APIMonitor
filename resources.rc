@@ -2,13 +2,13 @@
 #include "resource.h"
 
 // Application icon (shows in taskbar, file explorer)
-IDI_APPICON ICON "success.ico"
+IDI_APPICON ICON "assets/success.ico"
 
 // Embedded icons
-IDI_EMPTY   ICON "empty.ico"
-IDI_SUCCESS ICON "success.ico"
-IDI_FAIL    ICON "fail.ico"
-IDI_BLANK   ICON "blank.ico"
+IDI_EMPTY   ICON "assets/empty.ico"
+IDI_SUCCESS ICON "assets/success.ico"
+IDI_FAIL    ICON "assets/fail.ico"
+IDI_BLANK   ICON "assets/blank.ico"
 
 // WebView2 UI resources
 IDR_HTML_UI      RCDATA "assets/dist/index.html"

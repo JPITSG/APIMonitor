@@ -33,7 +33,7 @@ main.o: $(SOURCES) resource.h
 	@echo "Compiling $(SOURCES)..."
 	$(CC) -c $< -o $@ $(CFLAGS)
 
-resources.o: $(RESOURCES) resource.h empty.ico success.ico fail.ico blank.ico assets/dist/index.html assets/WebView2Loader.dll
+resources.o: $(RESOURCES) resource.h assets/empty.ico assets/success.ico assets/fail.ico assets/blank.ico assets/dist/index.html assets/WebView2Loader.dll
 	@echo "Compiling resources..."
 	$(WINDRES) $< -o $@
 
@@ -45,9 +45,9 @@ assets: assets/dist/index.html
 
 # Generate multi-sized .ico files from .svg sources using ImageMagick
 icons:
-	@for svg in *.svg; do \
+	@for svg in assets/*.svg; do \
 		if [ -f "$$svg" ]; then \
-			ico=$$(basename "$$svg" .svg).ico; \
+			ico=assets/$$(basename "$$svg" .svg).ico; \
 			echo "Generating $$ico from $$svg..."; \
 			convert -background transparent "$$svg" \
 				$(foreach size,$(ICON_SIZES),\( -clone 0 -resize $(size)x$(size) \)) \
