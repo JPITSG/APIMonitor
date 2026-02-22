@@ -1698,34 +1698,68 @@ void ShowHistoryDialog(HWND hwndParent) {
 
 static BOOL load_webview2_loader(void) {
     HRSRC hRes = FindResource(NULL, MAKEINTRESOURCE(IDR_WEBVIEW2_DLL), RT_RCDATA);
-    if (hRes) {
-        HGLOBAL hData = LoadResource(NULL, hRes);
-        DWORD dllSize = SizeofResource(NULL, hRes);
-        const void *dllBytes = LockResource(hData);
-        if (dllBytes && dllSize > 0) {
-            WCHAR tempDir[MAX_PATH];
-            DWORD tempLen = GetTempPathW(MAX_PATH, tempDir);
-            if (tempLen > 0 && tempLen < MAX_PATH - 30) {
-                swprintf(g_extractedDllPath, MAX_PATH, L"%sWebView2Loader.dll", tempDir);
-                HANDLE hFile = CreateFileW(g_extractedDllPath, GENERIC_WRITE, 0, NULL,
-                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (hFile != INVALID_HANDLE_VALUE) {
-                    DWORD written = 0;
-                    WriteFile(hFile, dllBytes, dllSize, &written, NULL);
-                    CloseHandle(hFile);
-                    if (written == dllSize) {
-                        HMODULE hMod = LoadLibraryW(g_extractedDllPath);
-                        if (hMod) {
-                            fnCreateEnvironment = (PFN_CreateCoreWebView2EnvironmentWithOptions)
-                                GetProcAddress(hMod, "CreateCoreWebView2EnvironmentWithOptions");
-                            if (fnCreateEnvironment) return TRUE;
-                        }
-                    }
-                }
-            }
-        }
+    if (!hRes) {
+        MessageBoxW(NULL, L"Failed to find WebView2Loader.dll in embedded resources.\n"
+            L"The executable may need to be rebuilt.", L"API Monitor", MB_ICONERROR);
+        return FALSE;
     }
-    return FALSE;
+    HGLOBAL hData = LoadResource(NULL, hRes);
+    DWORD dllSize = SizeofResource(NULL, hRes);
+    const void *dllBytes = LockResource(hData);
+    if (!dllBytes || dllSize == 0) {
+        MessageBoxW(NULL, L"Failed to load WebView2Loader.dll from embedded resources.",
+            L"API Monitor", MB_ICONERROR);
+        return FALSE;
+    }
+    WCHAR tempDir[MAX_PATH];
+    DWORD tempLen = GetTempPathW(MAX_PATH, tempDir);
+    if (tempLen == 0 || tempLen >= MAX_PATH - 50) {
+        MessageBoxW(NULL, L"Failed to get temp directory path.", L"API Monitor", MB_ICONERROR);
+        return FALSE;
+    }
+    // Use an APIMonitor-specific subdirectory to avoid conflicts
+    swprintf(g_extractedDllPath, MAX_PATH, L"%sAPIMonitor", tempDir);
+    CreateDirectoryW(g_extractedDllPath, NULL);
+    swprintf(g_extractedDllPath, MAX_PATH, L"%sAPIMonitor\\WebView2Loader.dll", tempDir);
+
+    // Try to load existing copy first (may already be extracted from a previous run)
+    HMODULE hMod = LoadLibraryW(g_extractedDllPath);
+    if (!hMod) {
+        // Extract fresh copy
+        HANDLE hFile = CreateFileW(g_extractedDllPath, GENERIC_WRITE, 0, NULL,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            WCHAR msg[512];
+            swprintf(msg, 512, L"Failed to write WebView2Loader.dll to temp directory.\n\n"
+                L"Path: %s\nError: %lu", g_extractedDllPath, GetLastError());
+            MessageBoxW(NULL, msg, L"API Monitor", MB_ICONERROR);
+            return FALSE;
+        }
+        DWORD written = 0;
+        WriteFile(hFile, dllBytes, dllSize, &written, NULL);
+        CloseHandle(hFile);
+        if (written != dllSize) {
+            MessageBoxW(NULL, L"Failed to write complete WebView2Loader.dll to temp directory.",
+                L"API Monitor", MB_ICONERROR);
+            return FALSE;
+        }
+        hMod = LoadLibraryW(g_extractedDllPath);
+    }
+    if (!hMod) {
+        WCHAR msg[512];
+        swprintf(msg, 512, L"Failed to load WebView2Loader.dll.\n\n"
+            L"Path: %s\nError: %lu", g_extractedDllPath, GetLastError());
+        MessageBoxW(NULL, msg, L"API Monitor", MB_ICONERROR);
+        return FALSE;
+    }
+    fnCreateEnvironment = (PFN_CreateCoreWebView2EnvironmentWithOptions)
+        GetProcAddress(hMod, "CreateCoreWebView2EnvironmentWithOptions");
+    if (!fnCreateEnvironment) {
+        MessageBoxW(NULL, L"WebView2Loader.dll loaded but CreateCoreWebView2EnvironmentWithOptions not found.\n\n"
+            L"The DLL may be corrupted or the wrong version.", L"API Monitor", MB_ICONERROR);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static void webview_execute_script(const wchar_t* script) {
@@ -2144,11 +2178,6 @@ static void ShowWebViewDialog(const char* view, int width, int height) {
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
     if (!fnCreateEnvironment && !load_webview2_loader()) {
-        MessageBoxW(NULL,
-            L"Failed to load WebView2.\n\n"
-            L"Please ensure the Microsoft Edge WebView2 Runtime is installed.\n"
-            L"Download from: https://developer.microsoft.com/en-us/microsoft-edge/webview2/",
-            L"API Monitor", MB_ICONERROR | MB_OK);
         return;
     }
 
