@@ -119,4 +119,4 @@ If a `config.ini` file exists from a previous version, settings are migrated to 
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+[MIT](LICENSE)
