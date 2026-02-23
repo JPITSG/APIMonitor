@@ -2226,11 +2226,13 @@ static void ShowWebViewDialog(const char* view, int width, int height) {
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = WebViewWndProc;
         wc.hInstance = g_hInstance;
-        wc.hIcon = LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_APPICON));
+        wc.hIcon = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCEW(IDI_APPICON),
+            IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
         wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
         wc.lpszClassName = L"APIMonitorWebViewWnd";
-        wc.hIconSm = LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_APPICON));
+        wc.hIconSm = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCEW(IDI_APPICON),
+            IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
         RegisterClassExW(&wc);
         classRegistered = TRUE;
     }
