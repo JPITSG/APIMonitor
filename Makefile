@@ -16,7 +16,7 @@ ICON_SIZES = 16 24 32 48 256
 
 CFLAGS = -O2 -mwindows -I.
 LDFLAGS = -mwindows
-LIBS = -lwinhttp -lshell32 -luser32 -lgdi32 -ladvapi32 -lcomctl32 -lole32
+LIBS = -lwinhttp -lshell32 -luser32 -lgdi32 -ladvapi32 -lcomctl32 -lole32 -lversion
 
 .PHONY: all clean icons assets
 
@@ -29,11 +29,11 @@ $(RELEASE_DIR)/$(TARGET): $(OBJ)
 	@rm -f $(OBJ)
 	@echo "Build complete: $(RELEASE_DIR)/$(TARGET)"
 
-main.o: $(SOURCES) resource.h
+main.o: $(SOURCES) resource.h version.h
 	@echo "Compiling $(SOURCES)..."
 	$(CC) -c $< -o $@ $(CFLAGS)
 
-resources.o: $(RESOURCES) resource.h assets/empty.ico assets/success.ico assets/fail.ico assets/blank.ico assets/dist/index.html assets/WebView2Loader.dll
+resources.o: $(RESOURCES) resource.h version.h assets/empty.ico assets/success.ico assets/fail.ico assets/blank.ico assets/dist/index.html assets/WebView2Loader.dll
 	@echo "Compiling resources..."
 	$(WINDRES) $< -o $@
 

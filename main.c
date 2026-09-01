@@ -10,6 +10,7 @@
 #include <commctrl.h>
 #include <objbase.h>
 #include "resource.h"
+#include "version.h"
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "shell32.lib")
@@ -452,7 +453,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         strcat(logFilePath, "\\APIMonitor.log");
     }
 
-    LogMessage("=== Application starting (Version: APIMonitor/1.0) ===");
+    LogMessage("=== Application starting (Version: APIMonitor/%s) ===", APP_VERSION_STRING);
 
     // Single instance check
     g_hMutex = CreateMutexA(NULL, TRUE, "Global\\APIMonitor_SingleInstance_Mutex");
