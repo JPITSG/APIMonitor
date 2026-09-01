@@ -25,13 +25,11 @@ import {
 
 interface ConfigViewProps {
   config: ConfigData;
-  webView2Version: string;
   updateCompletedVersion: string;
 }
 
 export default function ConfigView({
   config,
-  webView2Version,
   updateCompletedVersion,
 }: ConfigViewProps) {
   const [url, setUrl] = useState(config.url);
@@ -282,9 +280,9 @@ export default function ConfigView({
       <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
         <span
           className="select-none whitespace-nowrap text-[10px] leading-none tabular-nums text-neutral-400"
-          title="Application version / WebView2 version"
+          title="Application version"
         >
-          v{__APP_VERSION__} / {webView2Version}
+          v{__APP_VERSION__}
         </span>
         <div className="flex items-center gap-2">
           <Button
