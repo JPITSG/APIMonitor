@@ -15,6 +15,7 @@ A Windows system tray application that monitors an API endpoint and displays its
 - Log file at `ProgramData\APIMonitor\APIMonitor.log` (auto-truncated at 10MB)
 - Single-instance enforcement
 - Display/DPI change detection for RDP reconnects
+- Self-update flow with embedded version checks, cancellable downloads, UAC replacement, rollback, and automatic hourly checks
 
 ## Requirements
 
@@ -87,10 +88,29 @@ On first launch a configuration dialog is shown. It can also be opened from the 
 | Check Interval | `RefreshInterval` | REG_DWORD | `60` (seconds) |
 | Enable Logging | `LoggingEnabled` | REG_DWORD | `1` |
 | History Limit | `HistoryLimit` | REG_DWORD | `100` (10–10,000) |
+| Automatically Check for Updates | `AutoCheckForUpdates` | REG_DWORD | `1` |
 
 Settings are stored under `HKEY_CURRENT_USER\SOFTWARE\JPIT\APIMonitor`.
 
 If a `config.ini` file exists from a previous version, settings are migrated to the registry on first launch.
+
+## Updates
+
+When automatic checks are enabled, APIMonitor checks at startup, whenever the
+configuration dialog opens, and every 60 minutes. A newer build opens Configure
+and displays its update prompt. **Ignore this version** suppresses that version
+during later automatic checks; the manual **Update** button still displays every
+result and can reinstall the current version.
+
+Checks download [`release/APIMonitor.exe`](release/APIMonitor.exe) to the user's
+temporary directory and compare its embedded Windows file version with the
+running executable. The download is size-limited, reports transfer speed, and
+can be cancelled. An older repository build is never installable.
+
+Installing uses a short-lived elevated helper to replace the executable and
+restart APIMonitor in the user's normal session. If replacement or restart
+fails, the previous executable is restored. Temporary files are removed after
+the restarted application confirms a successful handoff.
 
 ## Project Structure
 
@@ -98,6 +118,7 @@ If a `config.ini` file exists from a previous version, settings are migrated to 
 ├── main.c              # Application source (tray icon, API polling, WebView2 integration)
 ├── resource.h          # Resource IDs
 ├── resources.rc        # Resource definitions (icons, HTML, DLL)
+├── version.h           # Application and Windows resource version
 ├── Makefile            # Cross-compilation build system
 ├── assets/
 │   ├── src/

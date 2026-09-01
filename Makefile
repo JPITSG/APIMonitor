@@ -8,6 +8,10 @@ TARGET = APIMonitor.exe
 SOURCES = main.c
 RESOURCES = resources.rc
 RELEASE_DIR = release
+FRONTEND_SOURCES = $(shell find assets/src -type f) \
+	assets/index.html assets/package.json assets/package-lock.json \
+	assets/vite.config.ts assets/tsconfig.json assets/postcss.config.js \
+	assets/tailwind.config.ts
 
 OBJ = main.o resources.o
 
@@ -16,7 +20,7 @@ ICON_SIZES = 16 24 32 48 256
 
 CFLAGS = -O2 -mwindows -I.
 LDFLAGS = -mwindows
-LIBS = -lwinhttp -lshell32 -luser32 -lgdi32 -ladvapi32 -lcomctl32 -lole32 -lversion
+LIBS = -lwinhttp -lshell32 -lshlwapi -luser32 -lgdi32 -ladvapi32 -lcomctl32 -lole32 -lversion -lbcrypt -luserenv
 
 .PHONY: all clean icons assets
 
@@ -37,7 +41,7 @@ resources.o: $(RESOURCES) resource.h version.h assets/empty.ico assets/success.i
 	@echo "Compiling resources..."
 	$(WINDRES) $< -o $@
 
-assets/dist/index.html: assets/package.json assets/src/App.tsx assets/src/ConfigView.tsx assets/src/HistoryView.tsx assets/src/lib/bridge.ts
+assets/dist/index.html: $(FRONTEND_SOURCES)
 	@echo "Building frontend assets..."
 	cd assets && npm install && npm run build
 

@@ -9,23 +9,60 @@ import {
   validateUrl,
   saveSettings,
   closeDialog,
+  configReady,
+  checkForUpdate,
+  cancelUpdateCheck,
+  installUpdate,
+  dismissUpdate,
+  ignoreUpdateVersion,
+  dismissUpdateConfirmation,
+  onUpdateResult,
+  onUpdateProgress,
   type ConfigData,
+  type UpdateResult,
   type ValidationResult,
 } from "./lib/bridge";
 
 interface ConfigViewProps {
   config: ConfigData;
+  webView2Version: string;
+  updateCompletedVersion: string;
 }
 
-export default function ConfigView({ config }: ConfigViewProps) {
+export default function ConfigView({
+  config,
+  webView2Version,
+  updateCompletedVersion,
+}: ConfigViewProps) {
   const [url, setUrl] = useState(config.url);
   const [interval, setInterval] = useState(config.interval);
   const [loggingEnabled, setLoggingEnabled] = useState(config.loggingEnabled);
   const [historyLimit, setHistoryLimit] = useState(String(config.historyLimit));
+  const [autoCheckForUpdates, setAutoCheckForUpdates] = useState(
+    config.autoCheckForUpdates ?? true
+  );
 
   // 0=none, 1=checking, 2=valid, 3=invalid
   const [validationState, setValidationState] = useState<number>(0);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [updateChecking, setUpdateChecking] = useState(
+    config.updateCheckPending ?? false
+  );
+  const [updateCancelling, setUpdateCancelling] = useState(false);
+  const [updateSpeedKbps, setUpdateSpeedKbps] = useState<number | null>(null);
+  const [updateAlert, setUpdateAlert] = useState<UpdateResult | null>(() =>
+    updateCompletedVersion
+      ? {
+          status: "completed",
+          title: "Update complete",
+          message: `APIMonitor has been updated to version ${updateCompletedVersion}.`,
+          currentVersion: "",
+          remoteVersion: "",
+          automatic: false,
+        }
+      : null
+  );
+  const automaticUpdateStarted = useRef(false);
 
   const handleValidationResult = useCallback((result: ValidationResult) => {
     setValidationState(result.valid ? 2 : 3);
@@ -40,6 +77,85 @@ export default function ConfigView({ config }: ConfigViewProps) {
       validateUrl(config.url.trim());
     }
   }, [config.url, handleValidationResult]);
+
+  useEffect(() => {
+    const removeResultListener = onUpdateResult((result) => {
+      setUpdateChecking(false);
+      setUpdateCancelling(false);
+      setUpdateSpeedKbps(null);
+      if (result.status === "cancelled") {
+        setUpdateAlert((current) =>
+          result.automatic && current?.status === "completed" ? current : null
+        );
+      } else if (result.automatic && result.status !== "newer") {
+        setUpdateAlert((current) =>
+          current?.status === "completed" ? current : null
+        );
+      } else {
+        setUpdateAlert(result);
+      }
+    });
+    const removeProgressListener = onUpdateProgress((progress) => {
+      setUpdateSpeedKbps(Math.max(0, Math.round(progress.kilobytesPerSecond)));
+    });
+
+    const shouldCheckAutomatically =
+      config.autoCheckForUpdates &&
+      !updateCompletedVersion &&
+      !config.updateCheckPending &&
+      !config.updatePromptPending &&
+      !automaticUpdateStarted.current;
+    if (shouldCheckAutomatically) {
+      automaticUpdateStarted.current = true;
+      setUpdateChecking(true);
+    }
+    configReady(shouldCheckAutomatically);
+
+    return () => {
+      removeResultListener();
+      removeProgressListener();
+    };
+  }, [
+    config.autoCheckForUpdates,
+    config.updateCheckPending,
+    config.updatePromptPending,
+    updateCompletedVersion,
+  ]);
+
+  const handleUpdate = () => {
+    if (updateChecking) {
+      setUpdateCancelling(true);
+      cancelUpdateCheck();
+      return;
+    }
+    setUpdateAlert(null);
+    setUpdateChecking(true);
+    setUpdateCancelling(false);
+    setUpdateSpeedKbps(null);
+    checkForUpdate(false);
+  };
+
+  const handleInstallUpdate = () => {
+    setUpdateChecking(true);
+    setUpdateCancelling(false);
+    setUpdateSpeedKbps(null);
+    installUpdate();
+  };
+
+  const handleDismissUpdate = () => {
+    if (updateAlert?.status === "completed") {
+      dismissUpdateConfirmation();
+    } else {
+      dismissUpdate();
+    }
+    setUpdateAlert(null);
+  };
+
+  const handleIgnoreUpdateVersion = () => {
+    if (!updateAlert?.remoteVersion) return;
+    ignoreUpdateVersion(updateAlert.remoteVersion);
+    setUpdateAlert(null);
+  };
 
   const handleUrlChange = (newUrl: string) => {
     setUrl(newUrl);
@@ -71,6 +187,9 @@ export default function ConfigView({ config }: ConfigViewProps) {
       interval,
       loggingEnabled,
       historyLimit: hl,
+      autoCheckForUpdates,
+      updateCheckPending: config.updateCheckPending,
+      updatePromptPending: config.updatePromptPending,
     });
   };
 
@@ -145,14 +264,145 @@ export default function ConfigView({ config }: ConfigViewProps) {
         />
       </div>
 
-      <div className="flex justify-end gap-2 pt-1">
-        <Button variant="outline" size="sm" className="min-w-[5rem]" onClick={() => closeDialog()}>
-          Cancel
-        </Button>
-        <Button size="sm" className="min-w-[5rem]" onClick={handleSave}>
-          Save
-        </Button>
+      <div data-row className="flex items-start justify-between gap-3">
+        <div className="flex flex-col">
+          <Label htmlFor="auto-update">Automatically Check for Updates</Label>
+          <span className="text-[10px] text-neutral-500 leading-tight mt-1.5">
+            Checks at startup, when Configure opens, and every 60 minutes.
+          </span>
+        </div>
+        <Switch
+          id="auto-update"
+          checked={autoCheckForUpdates}
+          onCheckedChange={setAutoCheckForUpdates}
+          className="shrink-0 mt-0.5"
+        />
       </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+        <span
+          className="select-none whitespace-nowrap text-[10px] leading-none tabular-nums text-neutral-400"
+          title="Application version / WebView2 version"
+        >
+          v{__APP_VERSION__} / {webView2Version}
+        </span>
+        <div className="flex items-center gap-2">
+          <Button
+            variant={updateChecking ? "destructive" : "outline"}
+            size="sm"
+            className="min-w-[5rem]"
+            disabled={updateCancelling}
+            aria-label={
+              updateChecking ? "Stop update check and download" : undefined
+            }
+            title={
+              updateChecking ? "Stop update check and download" : undefined
+            }
+            onClick={handleUpdate}
+          >
+            {updateCancelling
+              ? "Stopping..."
+              : updateChecking
+                ? updateSpeedKbps === null
+                  ? "Checking..."
+                  : `Checking (${updateSpeedKbps.toLocaleString()} KB/s)...`
+                : "Update"}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="min-w-[5rem]"
+            onClick={() => closeDialog()}
+          >
+            Cancel
+          </Button>
+          <Button size="sm" className="min-w-[5rem]" onClick={handleSave}>
+            Save
+          </Button>
+        </div>
+      </div>
+
+      {updateAlert && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 p-4">
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="update-alert-title"
+            aria-describedby="update-alert-message"
+            className="w-full max-w-sm space-y-3 rounded-lg border border-neutral-200 bg-white p-4 shadow-xl"
+          >
+            <div className="space-y-1">
+              <h2 id="update-alert-title" className="text-sm font-semibold">
+                {updateAlert.title}
+              </h2>
+              <p
+                id="update-alert-message"
+                className="text-xs leading-relaxed text-neutral-600"
+              >
+                {updateAlert.message}
+              </p>
+            </div>
+            {updateAlert.currentVersion && updateAlert.remoteVersion && (
+              <dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
+                <dt className="text-neutral-500">Current version</dt>
+                <dd className="font-medium tabular-nums text-neutral-900">
+                  {updateAlert.currentVersion}
+                </dd>
+                <dt className="text-neutral-500">Remote version</dt>
+                <dd className="font-medium tabular-nums text-neutral-900">
+                  {updateAlert.remoteVersion}
+                </dd>
+              </dl>
+            )}
+            <div className="flex justify-end gap-2">
+              {updateAlert.status === "newer" && updateAlert.automatic && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={updateChecking}
+                  onClick={handleIgnoreUpdateVersion}
+                >
+                  Ignore this version
+                </Button>
+              )}
+              {(updateAlert.status === "newer" ||
+                updateAlert.status === "same") && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  autoFocus
+                  disabled={updateChecking}
+                  onClick={handleDismissUpdate}
+                >
+                  Cancel
+                </Button>
+              )}
+              <Button
+                size="sm"
+                autoFocus={
+                  updateAlert.status !== "newer" &&
+                  updateAlert.status !== "same"
+                }
+                disabled={updateChecking}
+                onClick={
+                  updateAlert.status === "newer" ||
+                  updateAlert.status === "same"
+                    ? handleInstallUpdate
+                    : handleDismissUpdate
+                }
+              >
+                {updateChecking
+                  ? "Starting..."
+                  : updateAlert.status === "same"
+                    ? "Force update"
+                    : updateAlert.status === "newer"
+                      ? "Update"
+                      : "OK"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

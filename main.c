@@ -7,8 +7,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <wchar.h>
+#include <stdarg.h>
 #include <commctrl.h>
 #include <objbase.h>
+#include <shellapi.h>
+#include <sddl.h>
+#include <shlwapi.h>
+#include <bcrypt.h>
+#include <userenv.h>
+#include <winver.h>
 #include "resource.h"
 #include "version.h"
 
@@ -33,11 +41,25 @@
 #define REG_VALUE_HISTORY_LIMIT "HistoryLimit"
 #define REG_VALUE_HISTORY_COUNT "HistoryCount"
 #define REG_VALUE_HISTORY_DATA  "HistoryData"
+#define REG_VALUE_AUTO_UPDATE "AutoCheckForUpdates"
+#define REG_VALUE_IGNORED_UPDATE_VERSION_W L"IgnoredUpdateVersion"
+#define REG_KEY_PATH_W L"SOFTWARE\\JPIT\\APIMonitor"
 
 #define WM_VALIDATE_RESULT      (WM_APP + 1)
+#define WM_APP_UPDATE_RESULT    (WM_APP + 2)
+#define WM_APP_UPDATE_PROGRESS  (WM_APP + 3)
 #define WM_SHOW_FIRST_CONFIG    (WM_USER + 2)
 #define ID_TIMER_WEBVIEW_SHOW_FALLBACK 1006
 #define WEBVIEW_SHOW_FALLBACK_DELAY_MS 350
+#define ID_TIMER_AUTO_UPDATE 1007
+#define AUTO_UPDATE_INTERVAL_MS (60u * 60u * 1000u)
+
+#define APP_NAME L"APIMonitor"
+#define UPDATE_URL L"https://github.com/JPITSG/APIMonitor/raw/refs/heads/main/release/APIMonitor.exe"
+#define UPDATE_MAX_BYTES (100ULL * 1024ULL * 1024ULL)
+#define UPDATE_PROGRESS_INTERVAL_MS 250
+#define UPDATE_HELPER_READY_MS 10000
+#define UPDATE_HELPER_WAIT_MS 120000
 
 typedef enum {
     RESULT_NONE,         // Initial state - no result yet
@@ -87,6 +109,7 @@ static HINSTANCE g_hInstance = NULL;
 static HANDLE g_hMutex = NULL;  // Mutex for single instance check
 static CRITICAL_SECTION logCriticalSection;  // For thread-safe logging
 static BOOL configLoggingEnabled = TRUE; // Global variable for logging toggle (default true)
+static BOOL configAutoCheckForUpdates = TRUE;
 static int configHistoryLimit = 100;
 static HistoryEntry* historyBuffer = NULL;
 static int historyCapacity = 0;
@@ -332,6 +355,48 @@ static ICoreWebView2Controller *g_webviewController = NULL;
 static ICoreWebView2 *g_webviewView = NULL;
 static char g_pendingView[16] = "";
 static BOOL g_webviewWindowShown = FALSE;
+static BOOL g_configViewReady = FALSE;
+static BOOL g_updateConfirmationPending = FALSE;
+static wchar_t g_webView2Version[128] = L"Unknown";
+
+typedef struct {
+    WORD major;
+    WORD minor;
+    WORD patch;
+    WORD build;
+} ExecutableVersion;
+
+typedef enum {
+    UPDATE_CHECK_SAME = 1,
+    UPDATE_CHECK_NEWER,
+    UPDATE_CHECK_OLDER,
+    UPDATE_CHECK_CANCELLED,
+    UPDATE_CHECK_ERROR
+} UpdateCheckKind;
+
+typedef struct {
+    HWND targetWindow;
+    BOOL automatic;
+    UpdateCheckKind kind;
+    ULONGLONG cacheBuster;
+    ExecutableVersion runningVersion;
+    ExecutableVersion availableVersion;
+    wchar_t message[512];
+    wchar_t targetPath[MAX_PATH];
+    wchar_t stagedPath[MAX_PATH];
+} UpdateCheckTask;
+
+static volatile LONG g_updateCheckPending = FALSE;
+static volatile LONG g_updateCheckAutomatic = FALSE;
+static BOOL g_updateInstallReady = FALSE;
+static volatile LONG g_updateRequestSequence = 0;
+static HANDLE g_updateCancelEvent = NULL;
+static volatile LONG g_updateSpeedKbps = 0;
+static volatile LONG g_updateProgressPosted = FALSE;
+static UpdateCheckTask* volatile g_updatePostedResult = NULL;
+static UpdateCheckTask* g_updateNoticeTask = NULL;
+static UpdateCheckTask* g_updateReadyTask = NULL;
+static wchar_t g_ignoredUpdateVersion[32] = L"";
 
 typedef HRESULT (STDAPICALLTYPE *PFN_CreateCoreWebView2EnvironmentWithOptions)(
     LPCWSTR browserExecutableFolder, LPCWSTR userDataFolder, void* options,
@@ -376,6 +441,15 @@ void FreeHistoryBuffer(void);
 void SaveHistoryToRegistry(void);
 void LoadHistoryFromRegistry(void);
 static void ShowWebViewDialog(const char* view, int width, int height);
+static void StartUpdateCheck(BOOL automatic);
+static void CancelUpdateCheck(void);
+static void InstallPreparedUpdate(void);
+static void DiscardPreparedUpdate(void);
+static void DiscardPendingUpdateNotice(void);
+static void DiscardUpdateTask(UpdateCheckTask* task);
+static void HandleCompletedUpdateCheck(UpdateCheckTask* task);
+static int HandleUpdateCommandLine(BOOL* handled, BOOL* updateCompleted);
+static void webview_execute_script(const wchar_t* script);
 
 // Logging function: writes to ProgramData\APIMonitor.log with timestamp and thread ID
 void LogMessage(const char* format, ...) {
@@ -429,6 +503,12 @@ void CheckLogFileSize() {
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    BOOL updateHelperHandled = FALSE;
+    BOOL updateCompleted = FALSE;
+    int updateHelperResult = HandleUpdateCommandLine(
+        &updateHelperHandled, &updateCompleted);
+    if (updateHelperHandled) return updateHelperResult;
+
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
     UNREFERENCED_PARAMETER(nCmdShow);
@@ -546,6 +626,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_hwnd = hwnd;
     LogMessage("Message window created.");
 
+    SetTimer(hwnd, ID_TIMER_AUTO_UPDATE, AUTO_UPDATE_INTERVAL_MS, NULL);
+    if (configAutoCheckForUpdates) StartUpdateCheck(TRUE);
+
     // Initialize tray icon
     InitTrayIcon(hwnd);
     LogMessage("Tray icon initialized.");
@@ -571,6 +654,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         PostMessage(hwnd, WM_SHOW_FIRST_CONFIG, 0, 0);
     }
 
+    if (updateCompleted) {
+        g_updateConfirmationPending = TRUE;
+        PostMessage(hwnd, WM_SHOW_FIRST_CONFIG, 0, 0);
+    }
+
     // Message loop
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
@@ -585,6 +673,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
+        case WM_APP_UPDATE_PROGRESS:
+            InterlockedExchange(&g_updateProgressPosted, FALSE);
+            if (InterlockedCompareExchange(&g_updateCheckPending,
+                                           FALSE, FALSE) == TRUE &&
+                g_configViewReady) {
+                DWORD speedKbps = (DWORD)InterlockedCompareExchange(
+                    &g_updateSpeedKbps, 0, 0);
+                wchar_t script[160];
+                swprintf(script, sizeof(script) / sizeof(wchar_t),
+                    L"window.onUpdateProgress({\"kilobytesPerSecond\":%lu})",
+                    (unsigned long)speedKbps);
+                webview_execute_script(script);
+            }
+            return 0;
+
+        case WM_APP_UPDATE_RESULT: {
+            UpdateCheckTask* task = (UpdateCheckTask*)InterlockedExchangePointer(
+                (PVOID volatile*)&g_updatePostedResult, NULL);
+            HandleCompletedUpdateCheck(task);
+            return 0;
+        }
+
         case WM_SHOW_FIRST_CONFIG:
             ShowConfigDialog(g_hwnd);
             break;
@@ -640,9 +750,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         case WM_TIMER:
             if (wParam == 1) RefreshTimer(hwnd, uMsg, wParam, 0);
             else if (wParam == 2) TooltipTimer(hwnd, uMsg, wParam, 0);
+            else if (wParam == ID_TIMER_AUTO_UPDATE && configAutoCheckForUpdates) {
+                StartUpdateCheck(TRUE);
+            }
             break;
 
         case WM_DESTROY:
+            KillTimer(hwnd, ID_TIMER_AUTO_UPDATE);
             LogMessage("Window destroyed.");
             PostQuitMessage(0);
             break;
@@ -720,6 +834,26 @@ BOOL LoadConfigFromRegistry() {
         if (configHistoryLimit > 10000) configHistoryLimit = 10000;
     }
 
+    // Read automatic update checks (enabled by default).
+    DWORD dwAutoUpdate = 1;
+    size = sizeof(dwAutoUpdate);
+    if (RegQueryValueExA(hKey, REG_VALUE_AUTO_UPDATE, NULL, &type,
+                         (LPBYTE)&dwAutoUpdate, &size) == ERROR_SUCCESS &&
+        type == REG_DWORD) {
+        configAutoCheckForUpdates = dwAutoUpdate != 0;
+    } else {
+        configAutoCheckForUpdates = TRUE;
+    }
+
+    size = sizeof(g_ignoredUpdateVersion);
+    if (RegQueryValueExW(hKey, REG_VALUE_IGNORED_UPDATE_VERSION_W, NULL,
+                         &type, (LPBYTE)g_ignoredUpdateVersion,
+                         &size) != ERROR_SUCCESS || type != REG_SZ) {
+        g_ignoredUpdateVersion[0] = L'\0';
+    }
+    g_ignoredUpdateVersion[
+        (sizeof(g_ignoredUpdateVersion) / sizeof(wchar_t)) - 1] = L'\0';
+
     RegCloseKey(hKey);
     return TRUE;
 }
@@ -753,9 +887,15 @@ void SaveConfigToRegistry() {
     RegSetValueExA(hKey, REG_VALUE_HISTORY_LIMIT, 0, REG_DWORD,
                    (const BYTE*)&dwHistoryLimit, sizeof(dwHistoryLimit));
 
+    DWORD dwAutoUpdate = configAutoCheckForUpdates ? 1 : 0;
+    RegSetValueExA(hKey, REG_VALUE_AUTO_UPDATE, 0, REG_DWORD,
+                   (const BYTE*)&dwAutoUpdate, sizeof(dwAutoUpdate));
+
     RegCloseKey(hKey);
-    LogMessage("Configuration saved to registry: URL=%s, Interval=%d, Logging=%s, HistoryLimit=%d",
-               configApiUrl, configRefreshInterval, configLoggingEnabled ? "enabled" : "disabled", configHistoryLimit);
+    LogMessage("Configuration saved to registry: URL=%s, Interval=%d, Logging=%s, HistoryLimit=%d, AutoUpdate=%s",
+               configApiUrl, configRefreshInterval,
+               configLoggingEnabled ? "enabled" : "disabled", configHistoryLimit,
+               configAutoCheckForUpdates ? "enabled" : "disabled");
 }
 
 BOOL IsFirstLaunch() {
@@ -1061,7 +1201,8 @@ DWORD WINAPI ValidateUrlThread(LPVOID param) {
 
     HINTERNET hSession = NULL, hConnect = NULL, hRequest = NULL;
 
-    hSession = WinHttpOpen(L"APIMonitor/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+    hSession = WinHttpOpen(L"APIMonitor/" APP_VERSION_WSTRING,
+                           WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                           WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) goto cleanup;
 
@@ -1359,7 +1500,8 @@ DWORD WINAPI RefreshThread(LPVOID param) {
         char errorMsg[128] = "";
 
         // Create session
-        hSession = WinHttpOpen(L"APIMonitor/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        hSession = WinHttpOpen(L"APIMonitor/" APP_VERSION_WSTRING,
+                               WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                               WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!hSession) {
             sprintf(errorMsg, "HTTP init failed: %lu", GetLastError());
@@ -1844,6 +1986,1442 @@ static void json_escape_string(const char *in, wchar_t *out, size_t outLen) {
     out[j] = L'\0';
 }
 
+static void LogUpdateMessage(const wchar_t* format, ...) {
+    wchar_t wideMessage[2048];
+    va_list args;
+    va_start(args, format);
+    vswprintf(wideMessage,
+              sizeof(wideMessage) / sizeof(wchar_t), format, args);
+    va_end(args);
+
+    int length = WideCharToMultiByte(CP_UTF8, 0, wideMessage, -1,
+                                     NULL, 0, NULL, NULL);
+    if (length <= 0) return;
+    char* utf8Message = (char*)malloc((size_t)length);
+    if (!utf8Message) return;
+    WideCharToMultiByte(CP_UTF8, 0, wideMessage, -1,
+                        utf8Message, length, NULL, NULL);
+    LogMessage("%s", utf8Message);
+    free(utf8Message);
+}
+
+static void json_escape_wstring(const wchar_t *in, wchar_t *out,
+                                size_t outLen) {
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j < outLen - 2; i++) {
+        wchar_t c = in[i];
+        if (c == L'"' || c == L'\\') {
+            if (j + 2 >= outLen) break;
+            out[j++] = L'\\';
+            out[j++] = c;
+        } else if (c == L'\n') {
+            if (j + 2 >= outLen) break;
+            out[j++] = L'\\';
+            out[j++] = L'n';
+        } else if (c == L'\r') {
+            if (j + 2 >= outLen) break;
+            out[j++] = L'\\';
+            out[j++] = L'r';
+        } else if (c == L'\t') {
+            if (j + 2 >= outLen) break;
+            out[j++] = L'\\';
+            out[j++] = L't';
+        } else {
+            out[j++] = c;
+        }
+    }
+    out[j] = L'\0';
+}
+
+// --- Self update -----------------------------------------------------------
+
+typedef struct {
+    HINTERNET session;
+    HINTERNET connection;
+    HINTERNET request;
+} UpdateHttpRequest;
+
+static void CloseUpdateHttpRequest(UpdateHttpRequest* http) {
+    if (!http) return;
+    if (http->request) WinHttpCloseHandle(http->request);
+    if (http->connection) WinHttpCloseHandle(http->connection);
+    if (http->session) WinHttpCloseHandle(http->session);
+    ZeroMemory(http, sizeof(*http));
+}
+
+static void SetUpdateTaskError(UpdateCheckTask* task, LPCWSTR message,
+                               DWORD errorCode) {
+    if (!task) return;
+    task->kind = UPDATE_CHECK_ERROR;
+    if (errorCode) {
+        swprintf_s(task->message, sizeof(task->message) / sizeof(wchar_t),
+                   L"%s (Windows error %lu).", message, (unsigned long)errorCode);
+    } else {
+        wcscpy_s(task->message, sizeof(task->message) / sizeof(wchar_t), message);
+    }
+}
+
+static BOOL CancelUpdateTaskIfRequested(UpdateCheckTask* task) {
+    if (!task || !g_updateCancelEvent ||
+        WaitForSingleObject(g_updateCancelEvent, 0) != WAIT_OBJECT_0) {
+        return FALSE;
+    }
+    task->kind = UPDATE_CHECK_CANCELLED;
+    task->message[0] = L'\0';
+    return TRUE;
+}
+
+static void PublishUpdateProgress(UpdateCheckTask* task, DWORD speedKbps) {
+    if (!task || CancelUpdateTaskIfRequested(task) ||
+        !IsWindow(task->targetWindow)) {
+        return;
+    }
+
+    InterlockedExchange(&g_updateSpeedKbps, (LONG)speedKbps);
+    if (InterlockedCompareExchange(&g_updateProgressPosted, TRUE, FALSE) == FALSE &&
+        !PostMessageW(task->targetWindow, WM_APP_UPDATE_PROGRESS, 0, 0)) {
+        InterlockedExchange(&g_updateProgressPosted, FALSE);
+    }
+}
+
+static BOOL OpenUpdateHttpRequest(LPCWSTR verb, ULONGLONG cacheBuster,
+                                  UpdateHttpRequest* http, DWORD* statusCode) {
+    if (!verb || !http) return FALSE;
+    ZeroMemory(http, sizeof(*http));
+    if (statusCode) *statusCode = 0;
+
+    wchar_t hostName[256] = L"";
+    wchar_t urlPath[2048] = L"";
+    wchar_t extraInfo[512] = L"";
+    URL_COMPONENTS components = {0};
+    components.dwStructSize = sizeof(components);
+    components.lpszHostName = hostName;
+    components.dwHostNameLength = sizeof(hostName) / sizeof(wchar_t);
+    components.lpszUrlPath = urlPath;
+    components.dwUrlPathLength = sizeof(urlPath) / sizeof(wchar_t);
+    components.lpszExtraInfo = extraInfo;
+    components.dwExtraInfoLength = sizeof(extraInfo) / sizeof(wchar_t);
+    if (!WinHttpCrackUrl(UPDATE_URL, 0, 0, &components)) return FALSE;
+
+    wchar_t objectName[2560];
+    if (wcscpy_s(objectName, sizeof(objectName) / sizeof(wchar_t), urlPath) != 0 ||
+        wcscat_s(objectName, sizeof(objectName) / sizeof(wchar_t), extraInfo) != 0) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+    // A unique query value makes each button click reach the current branch
+    // artifact even when an HTTP proxy or GitHub edge cache retains the
+    // previous response. HEAD and GET share the same value within one check.
+    wchar_t cacheSuffix[64];
+    wchar_t separator = wcschr(objectName, L'?') ? L'&' : L'?';
+    int cacheSuffixLength = swprintf_s(cacheSuffix,
+        sizeof(cacheSuffix) / sizeof(wchar_t), L"%lcslUpdate=%016llx",
+        separator, (unsigned long long)cacheBuster);
+    if (cacheSuffixLength <= 0 ||
+        wcscat_s(objectName, sizeof(objectName) / sizeof(wchar_t), cacheSuffix) != 0) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+    http->session = WinHttpOpen(L"APIMonitor Update",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!http->session) goto fail;
+    WinHttpSetTimeouts(http->session, 10000, 10000, 15000, 30000);
+
+    http->connection = WinHttpConnect(http->session, hostName,
+                                      components.nPort, 0);
+    if (!http->connection) goto fail;
+
+    DWORD flags = WINHTTP_FLAG_REFRESH;
+    if (components.nScheme == INTERNET_SCHEME_HTTPS) flags |= WINHTTP_FLAG_SECURE;
+    http->request = WinHttpOpenRequest(http->connection, verb, objectName,
+        NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!http->request) goto fail;
+
+    static const wchar_t noCacheHeaders[] =
+        L"Cache-Control: no-cache, no-store, max-age=0\r\nPragma: no-cache\r\n";
+    WinHttpAddRequestHeaders(http->request, noCacheHeaders, (DWORD)-1L,
+                            WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+    if (!WinHttpSendRequest(http->request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(http->request, NULL)) {
+        goto fail;
+    }
+
+    DWORD status = 0;
+    DWORD statusSize = sizeof(status);
+    if (!WinHttpQueryHeaders(http->request,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize,
+            WINHTTP_NO_HEADER_INDEX)) {
+        goto fail;
+    }
+    if (statusCode) *statusCode = status;
+    if (status != 200) {
+        CloseUpdateHttpRequest(http);
+        SetLastError(ERROR_WINHTTP_INVALID_SERVER_RESPONSE);
+        return FALSE;
+    }
+    return TRUE;
+
+fail: {
+        DWORD errorCode = GetLastError();
+        CloseUpdateHttpRequest(http);
+        SetLastError(errorCode);
+        return FALSE;
+    }
+}
+
+static BOOL QueryUpdateContentLength(HINTERNET request, ULONGLONG* size) {
+    if (!request || !size) return FALSE;
+    wchar_t lengthText[64] = L"";
+    DWORD lengthBytes = sizeof(lengthText);
+    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH,
+            WINHTTP_HEADER_NAME_BY_INDEX, lengthText, &lengthBytes,
+            WINHTTP_NO_HEADER_INDEX)) {
+        return FALSE;
+    }
+    lengthText[(sizeof(lengthText) / sizeof(wchar_t)) - 1] = L'\0';
+
+    wchar_t* end = NULL;
+    unsigned long long parsed = _wcstoui64(lengthText, &end, 10);
+    if (end == lengthText || !end || *end != L'\0' || parsed == 0) {
+        SetLastError(ERROR_INVALID_DATA);
+        return FALSE;
+    }
+    *size = (ULONGLONG)parsed;
+    return TRUE;
+}
+
+static BOOL GetExecutableVersion(LPCWSTR path, ExecutableVersion* version) {
+    if (!path || !*path || !version) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    DWORD ignored = 0;
+    DWORD infoSize = GetFileVersionInfoSizeW(path, &ignored);
+    if (infoSize == 0) {
+        DWORD errorCode = GetLastError();
+        SetLastError(errorCode ? errorCode : ERROR_RESOURCE_DATA_NOT_FOUND);
+        return FALSE;
+    }
+
+    BYTE* infoData = (BYTE*)malloc(infoSize);
+    if (!infoData) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+
+    if (!GetFileVersionInfoW(path, 0, infoSize, infoData)) {
+        DWORD errorCode = GetLastError();
+        free(infoData);
+        SetLastError(errorCode ? errorCode : ERROR_INVALID_DATA);
+        return FALSE;
+    }
+
+    VS_FIXEDFILEINFO* fixedInfo = NULL;
+    UINT fixedInfoSize = 0;
+    if (!VerQueryValueW(infoData, L"\\", (LPVOID*)&fixedInfo, &fixedInfoSize) ||
+        !fixedInfo || fixedInfoSize < sizeof(*fixedInfo) ||
+        fixedInfo->dwSignature != VS_FFI_SIGNATURE) {
+        free(infoData);
+        SetLastError(ERROR_INVALID_DATA);
+        return FALSE;
+    }
+
+    version->major = HIWORD(fixedInfo->dwFileVersionMS);
+    version->minor = LOWORD(fixedInfo->dwFileVersionMS);
+    version->patch = HIWORD(fixedInfo->dwFileVersionLS);
+    version->build = LOWORD(fixedInfo->dwFileVersionLS);
+    free(infoData);
+    return TRUE;
+}
+
+static int CompareExecutableVersions(const ExecutableVersion* left,
+                                     const ExecutableVersion* right) {
+    const WORD leftParts[] = {
+        left->major, left->minor, left->patch, left->build
+    };
+    const WORD rightParts[] = {
+        right->major, right->minor, right->patch, right->build
+    };
+    for (size_t index = 0; index < sizeof(leftParts) / sizeof(leftParts[0]); index++) {
+        if (leftParts[index] < rightParts[index]) return -1;
+        if (leftParts[index] > rightParts[index]) return 1;
+    }
+    return 0;
+}
+
+static void FormatExecutableVersion(const ExecutableVersion* version,
+                                    wchar_t* text, size_t textCch) {
+    if (!version || !text || textCch == 0) return;
+    if (swprintf_s(text, textCch, L"%u.%u.%u.%u",
+                   (unsigned int)version->major,
+                   (unsigned int)version->minor,
+                   (unsigned int)version->patch,
+                   (unsigned int)version->build) <= 0) {
+        text[0] = L'\0';
+    }
+}
+
+static void FormatExecutableVersionForDisplay(const ExecutableVersion* version,
+                                              wchar_t* text, size_t textCch) {
+    if (!version || !text || textCch == 0) return;
+    if (version->build == 0) {
+        if (swprintf_s(text, textCch, L"%u.%u.%u",
+                       (unsigned int)version->major,
+                       (unsigned int)version->minor,
+                       (unsigned int)version->patch) <= 0) {
+            text[0] = L'\0';
+        }
+        return;
+    }
+    FormatExecutableVersion(version, text, textCch);
+}
+
+static BOOL BuildUpdateTempPath(wchar_t path[MAX_PATH], LPCWSTR role,
+                                DWORD processId) {
+    if (!path || !role || !*role || processId == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    wchar_t tempDirectory[MAX_PATH];
+    DWORD tempLength = GetTempPathW(MAX_PATH, tempDirectory);
+    if (tempLength == 0) return FALSE;
+    if (tempLength >= MAX_PATH) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+    int length = swprintf_s(path, MAX_PATH, L"%s%s-%s-%lu.exe",
+                            tempDirectory, APP_NAME, role,
+                            (unsigned long)processId);
+    if (length <= 0 || length >= MAX_PATH) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL DeleteUpdateTempFile(LPCWSTR path) {
+    if (!path || !*path) return FALSE;
+    SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+    if (DeleteFileW(path)) return TRUE;
+    DWORD errorCode = GetLastError();
+    return errorCode == ERROR_FILE_NOT_FOUND || errorCode == ERROR_PATH_NOT_FOUND;
+}
+
+static BOOL QueryRemoteUpdateSize(UpdateCheckTask* task, ULONGLONG* size) {
+    if (CancelUpdateTaskIfRequested(task)) return FALSE;
+
+    UpdateHttpRequest http;
+    DWORD status = 0;
+    if (!OpenUpdateHttpRequest(L"HEAD", task->cacheBuster, &http, &status)) {
+        DWORD errorCode = GetLastError();
+        if (CancelUpdateTaskIfRequested(task)) return FALSE;
+        if (status) {
+            swprintf_s(task->message, sizeof(task->message) / sizeof(wchar_t),
+                       L"The update server returned HTTP status %lu.",
+                       (unsigned long)status);
+            task->kind = UPDATE_CHECK_ERROR;
+        } else {
+            SetUpdateTaskError(task, L"Could not contact the update server", errorCode);
+        }
+        return FALSE;
+    }
+    if (CancelUpdateTaskIfRequested(task)) {
+        CloseUpdateHttpRequest(&http);
+        return FALSE;
+    }
+
+    BOOL ok = QueryUpdateContentLength(http.request, size);
+    DWORD errorCode = ok ? ERROR_SUCCESS : GetLastError();
+    CloseUpdateHttpRequest(&http);
+    if (CancelUpdateTaskIfRequested(task)) return FALSE;
+    if (!ok) {
+        SetUpdateTaskError(task, L"The update server did not report a valid file size",
+                           errorCode);
+        return FALSE;
+    }
+    if (*size > UPDATE_MAX_BYTES) {
+        SetUpdateTaskError(task, L"The available update is unexpectedly large", 0);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
+    if (CancelUpdateTaskIfRequested(task)) return FALSE;
+
+    UpdateHttpRequest http;
+    DWORD status = 0;
+    if (!OpenUpdateHttpRequest(L"GET", task->cacheBuster, &http, &status)) {
+        DWORD errorCode = GetLastError();
+        if (CancelUpdateTaskIfRequested(task)) return FALSE;
+        if (status) {
+            swprintf_s(task->message, sizeof(task->message) / sizeof(wchar_t),
+                       L"The update download returned HTTP status %lu.",
+                       (unsigned long)status);
+            task->kind = UPDATE_CHECK_ERROR;
+        } else {
+            SetUpdateTaskError(task, L"Could not download the update", errorCode);
+        }
+        return FALSE;
+    }
+    if (CancelUpdateTaskIfRequested(task)) {
+        CloseUpdateHttpRequest(&http);
+        return FALSE;
+    }
+
+    ULONGLONG downloadSize = 0;
+    if (QueryUpdateContentLength(http.request, &downloadSize) &&
+        downloadSize != expectedSize) {
+        CloseUpdateHttpRequest(&http);
+        SetUpdateTaskError(task,
+            L"The available update changed while it was being downloaded. Try again", 0);
+        return FALSE;
+    }
+    if (CancelUpdateTaskIfRequested(task)) {
+        CloseUpdateHttpRequest(&http);
+        return FALSE;
+    }
+
+    DeleteUpdateTempFile(task->stagedPath);
+    HANDLE file = CreateFileW(task->stagedPath, GENERIC_WRITE, 0, NULL,
+                              CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        DWORD errorCode = GetLastError();
+        CloseUpdateHttpRequest(&http);
+        SetUpdateTaskError(task, L"Could not create the staged update file", errorCode);
+        return FALSE;
+    }
+
+    BOOL ok = TRUE;
+    ULONGLONG totalWritten = 0;
+    ULONGLONG speedWindowBytes = 0;
+    ULONGLONG speedWindowStarted = GetTickCount64();
+    BYTE buffer[64 * 1024];
+    while (ok) {
+        if (CancelUpdateTaskIfRequested(task)) {
+            ok = FALSE;
+            break;
+        }
+
+        DWORD bytesRead = 0;
+        if (!WinHttpReadData(http.request, buffer, sizeof(buffer), &bytesRead)) {
+            DWORD errorCode = GetLastError();
+            if (!CancelUpdateTaskIfRequested(task)) {
+                SetUpdateTaskError(task, L"The update download was interrupted", errorCode);
+            }
+            ok = FALSE;
+            break;
+        }
+        if (CancelUpdateTaskIfRequested(task)) {
+            ok = FALSE;
+            break;
+        }
+        if (bytesRead == 0) break;
+        if (totalWritten + bytesRead > expectedSize) {
+            SetUpdateTaskError(task, L"The downloaded update has an invalid size", 0);
+            ok = FALSE;
+            break;
+        }
+
+        DWORD bytesWritten = 0;
+        if (!WriteFile(file, buffer, bytesRead, &bytesWritten, NULL)) {
+            SetUpdateTaskError(task, L"Could not write the staged update", GetLastError());
+            ok = FALSE;
+            break;
+        }
+        if (bytesWritten != bytesRead) {
+            SetUpdateTaskError(task, L"Could not write the staged update",
+                               ERROR_WRITE_FAULT);
+            ok = FALSE;
+            break;
+        }
+        totalWritten += bytesWritten;
+        speedWindowBytes += bytesWritten;
+
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG elapsed = now - speedWindowStarted;
+        if (elapsed >= UPDATE_PROGRESS_INTERVAL_MS) {
+            ULONGLONG speed = (speedWindowBytes * 1000ULL) /
+                              (elapsed * 1024ULL);
+            if (speed == 0 && speedWindowBytes > 0) speed = 1;
+            if (speed > MAXLONG) speed = MAXLONG;
+            PublishUpdateProgress(task, (DWORD)speed);
+            speedWindowBytes = 0;
+            speedWindowStarted = now;
+        }
+    }
+
+    if (ok && CancelUpdateTaskIfRequested(task)) ok = FALSE;
+    if (ok && totalWritten != expectedSize) {
+        SetUpdateTaskError(task, L"The downloaded update is incomplete", 0);
+        ok = FALSE;
+    }
+    if (ok && !FlushFileBuffers(file)) {
+        SetUpdateTaskError(task, L"Could not finish writing the staged update", GetLastError());
+        ok = FALSE;
+    }
+    CloseHandle(file);
+    CloseUpdateHttpRequest(&http);
+
+    if (ok && CancelUpdateTaskIfRequested(task)) ok = FALSE;
+    DWORD binaryType = 0;
+    if (ok && (!GetBinaryTypeW(task->stagedPath, &binaryType) ||
+               binaryType != SCS_64BIT_BINARY)) {
+        SetUpdateTaskError(task, L"The downloaded file is not a valid 64-bit application", 0);
+        ok = FALSE;
+    }
+    if (!ok) DeleteUpdateTempFile(task->stagedPath);
+    return ok;
+}
+
+static void DiscardUpdateTask(UpdateCheckTask* task) {
+    if (!task) return;
+    if (task->stagedPath[0]) {
+        DeleteUpdateTempFile(task->stagedPath);
+    }
+    free(task);
+}
+
+static void PublishUpdateTask(UpdateCheckTask* task) {
+    CancelUpdateTaskIfRequested(task);
+    InterlockedExchange(&g_updateCheckPending, FALSE);
+    InterlockedExchange(&g_updateCheckAutomatic, FALSE);
+    if (!task || !IsWindow(task->targetWindow)) {
+        DiscardUpdateTask(task);
+        return;
+    }
+
+    UpdateCheckTask* previous = (UpdateCheckTask*)InterlockedExchangePointer(
+        (PVOID volatile*)&g_updatePostedResult, task);
+    DiscardUpdateTask(previous);
+    if (!PostMessageW(task->targetWindow, WM_APP_UPDATE_RESULT, 0, 0)) {
+        UpdateCheckTask* unclaimed = (UpdateCheckTask*)InterlockedExchangePointer(
+            (PVOID volatile*)&g_updatePostedResult, NULL);
+        DiscardUpdateTask(unclaimed);
+    }
+}
+
+static DWORD WINAPI UpdateCheckThread(LPVOID parameter) {
+    UpdateCheckTask* task = (UpdateCheckTask*)parameter;
+    if (CancelUpdateTaskIfRequested(task)) {
+        PublishUpdateTask(task);
+        return 0;
+    }
+
+    DWORD pathLength = GetModuleFileNameW(NULL, task->targetPath,
+                                         sizeof(task->targetPath) / sizeof(wchar_t));
+    if (pathLength == 0 || pathLength >= sizeof(task->targetPath) / sizeof(wchar_t)) {
+        SetUpdateTaskError(task, L"Could not determine the running executable path",
+                           GetLastError());
+        PublishUpdateTask(task);
+        return 0;
+    }
+
+    if (!GetExecutableVersion(task->targetPath, &task->runningVersion)) {
+        SetUpdateTaskError(task, L"Could not read the running application version",
+                           GetLastError());
+        PublishUpdateTask(task);
+        return 0;
+    }
+    if (CancelUpdateTaskIfRequested(task)) {
+        PublishUpdateTask(task);
+        return 0;
+    }
+
+    ULONGLONG remoteSize = 0;
+    if (!QueryRemoteUpdateSize(task, &remoteSize)) {
+        PublishUpdateTask(task);
+        return 0;
+    }
+    if (!BuildUpdateTempPath(task->stagedPath, L"download",
+                             GetCurrentProcessId())) {
+        SetUpdateTaskError(task, L"Could not create the temporary update path",
+                           GetLastError());
+        PublishUpdateTask(task);
+        return 0;
+    }
+    if (CancelUpdateTaskIfRequested(task)) {
+        PublishUpdateTask(task);
+        return 0;
+    }
+
+    if (!DownloadUpdateFile(task, remoteSize)) {
+        PublishUpdateTask(task);
+        return 0;
+    }
+    if (CancelUpdateTaskIfRequested(task)) {
+        PublishUpdateTask(task);
+        return 0;
+    }
+
+    if (!GetExecutableVersion(task->stagedPath, &task->availableVersion)) {
+        SetUpdateTaskError(task,
+            L"The downloaded application does not contain valid version information",
+            GetLastError());
+        PublishUpdateTask(task);
+        return 0;
+    }
+    if (CancelUpdateTaskIfRequested(task)) {
+        PublishUpdateTask(task);
+        return 0;
+    }
+
+    LogUpdateMessage(L"[INFO] Update versions: running %u.%u.%u.%u, available %u.%u.%u.%u\n",
+               (unsigned int)task->runningVersion.major,
+               (unsigned int)task->runningVersion.minor,
+               (unsigned int)task->runningVersion.patch,
+               (unsigned int)task->runningVersion.build,
+               (unsigned int)task->availableVersion.major,
+               (unsigned int)task->availableVersion.minor,
+               (unsigned int)task->availableVersion.patch,
+               (unsigned int)task->availableVersion.build);
+    int comparison = CompareExecutableVersions(&task->availableVersion,
+                                               &task->runningVersion);
+    task->kind = comparison > 0 ? UPDATE_CHECK_NEWER
+               : comparison < 0 ? UPDATE_CHECK_OLDER
+                                : UPDATE_CHECK_SAME;
+    PublishUpdateTask(task);
+    return 0;
+}
+
+static BOOL ParseUpdateProcessId(LPCWSTR text, DWORD* processId) {
+    if (!text || !processId || !*text) return FALSE;
+    wchar_t* end = NULL;
+    unsigned long value = wcstoul(text, &end, 10);
+    if (!end || *end != L'\0' || value == 0) return FALSE;
+    *processId = (DWORD)value;
+    return TRUE;
+}
+
+static BOOL ValidateUpdateTempFilePair(LPCWSTR helperPath,
+                                       LPCWSTR stagedPath,
+                                       DWORD processId) {
+    if (!helperPath || !stagedPath || !*helperPath || !*stagedPath) return FALSE;
+
+    wchar_t expectedHelperName[96], expectedStagedName[96];
+    int helperNameLength = swprintf_s(expectedHelperName,
+        sizeof(expectedHelperName) / sizeof(wchar_t),
+        APP_NAME L"-updater-%lu.exe", (unsigned long)processId);
+    int stagedNameLength = swprintf_s(expectedStagedName,
+        sizeof(expectedStagedName) / sizeof(wchar_t),
+        APP_NAME L"-download-%lu.exe", (unsigned long)processId);
+    if (helperNameLength <= 0 || stagedNameLength <= 0 ||
+        _wcsicmp(PathFindFileNameW(helperPath), expectedHelperName) != 0 ||
+        _wcsicmp(PathFindFileNameW(stagedPath), expectedStagedName) != 0) {
+        return FALSE;
+    }
+
+    wchar_t helperDirectory[MAX_PATH], stagedDirectory[MAX_PATH];
+    if (wcscpy_s(helperDirectory, MAX_PATH, helperPath) != 0 ||
+        wcscpy_s(stagedDirectory, MAX_PATH, stagedPath) != 0 ||
+        !PathRemoveFileSpecW(helperDirectory) ||
+        !PathRemoveFileSpecW(stagedDirectory)) {
+        return FALSE;
+    }
+    return _wcsicmp(helperDirectory, stagedDirectory) == 0;
+}
+
+static HANDLE DuplicateUpdateLaunchToken(HANDLE process) {
+    HANDLE processToken = NULL;
+    HANDLE launchToken = NULL;
+    if (!process ||
+        !OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE,
+                          &processToken)) {
+        return NULL;
+    }
+    DuplicateTokenEx(processToken, MAXIMUM_ALLOWED, NULL,
+                     SecurityImpersonation, TokenPrimary, &launchToken);
+    CloseHandle(processToken);
+    return launchToken;
+}
+
+static BOOL LaunchUpdateTarget(LPCWSTR targetPath, LPCWSTR stagedPath,
+                               LPCWSTR helperPath, DWORD helperProcessId,
+                               DWORD oldProcessId, HANDLE launchToken,
+                               BOOL successfulUpdate) {
+    wchar_t commandLine[MAX_PATH * 3 + 256];
+    LPCWSTR finishAction = successfulUpdate
+        ? L"--finish-update"
+        : L"--finish-update-cleanup";
+    int commandLength = swprintf_s(commandLine,
+        sizeof(commandLine) / sizeof(wchar_t),
+        L"\"%s\" %s %lu %lu \"%s\" \"%s\"", targetPath, finishAction,
+        (unsigned long)helperProcessId, (unsigned long)oldProcessId,
+        stagedPath, helperPath);
+    if (commandLength <= 0 ||
+        commandLength >= (int)(sizeof(commandLine) / sizeof(wchar_t))) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+    STARTUPINFOW startupInfo = {0};
+    startupInfo.cb = sizeof(startupInfo);
+    PROCESS_INFORMATION processInfo = {0};
+    BOOL launched = FALSE;
+    if (launchToken) {
+        wchar_t tokenCommandLine[MAX_PATH * 3 + 256];
+        wcscpy_s(tokenCommandLine,
+                 sizeof(tokenCommandLine) / sizeof(wchar_t), commandLine);
+        LPVOID environment = NULL;
+        BOOL hasEnvironment = CreateEnvironmentBlock(&environment, launchToken,
+                                                     FALSE);
+        launched = CreateProcessWithTokenW(launchToken, 0, targetPath,
+                                           tokenCommandLine,
+                                           hasEnvironment
+                                               ? CREATE_UNICODE_ENVIRONMENT : 0,
+                                           environment, NULL,
+                                           &startupInfo, &processInfo);
+        if (environment) DestroyEnvironmentBlock(environment);
+    }
+    if (!launched) {
+        ZeroMemory(&processInfo, sizeof(processInfo));
+        launched = CreateProcessW(targetPath, commandLine, NULL, NULL, FALSE,
+                                  0, NULL, NULL, &startupInfo, &processInfo);
+    }
+    if (launched) {
+        CloseHandle(processInfo.hProcess);
+        CloseHandle(processInfo.hThread);
+    }
+    return launched;
+}
+
+static int RestartAfterUpdateFailure(LPCWSTR targetPath, LPCWSTR stagedPath,
+                                     LPCWSTR helperPath, DWORD oldProcessId,
+                                     HANDLE launchToken, LPCWSTR message) {
+    MessageBoxW(NULL, message, APP_NAME L" Update", MB_OK | MB_ICONERROR);
+    LaunchUpdateTarget(targetPath, stagedPath, helperPath,
+                       GetCurrentProcessId(), oldProcessId, launchToken, FALSE);
+    if (launchToken) CloseHandle(launchToken);
+    DeleteUpdateTempFile(stagedPath);
+    SetFileAttributesW(helperPath, FILE_ATTRIBUTE_NORMAL);
+    MoveFileExW(helperPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+    return 1;
+}
+
+static int RunUpdateApplyHelper(DWORD oldProcessId, LPCWSTR readyEventName,
+                                LPCWSTR targetPath, LPCWSTR stagedPath) {
+    wchar_t expectedEventPrefix[96];
+    int prefixLength = swprintf_s(expectedEventPrefix,
+        sizeof(expectedEventPrefix) / sizeof(wchar_t),
+        L"Local\\APIMonitor_UpdateReady_%lu_",
+        (unsigned long)oldProcessId);
+    if (prefixLength <= 0 || !readyEventName ||
+        _wcsnicmp(readyEventName, expectedEventPrefix,
+                  (size_t)prefixLength) != 0) {
+        return ERROR_INVALID_DATA;
+    }
+
+    HANDLE readyEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, readyEventName);
+    if (!readyEvent) return (int)GetLastError();
+
+    HANDLE oldProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                                    FALSE, oldProcessId);
+    if (!oldProcess) {
+        DWORD errorCode = GetLastError();
+        CloseHandle(readyEvent);
+        return (int)errorCode;
+    }
+
+    wchar_t oldProcessPath[MAX_PATH];
+    DWORD oldProcessPathLength = sizeof(oldProcessPath) / sizeof(wchar_t);
+    if (!QueryFullProcessImageNameW(oldProcess, 0, oldProcessPath,
+                                    &oldProcessPathLength)) {
+        DWORD errorCode = GetLastError();
+        CloseHandle(oldProcess);
+        CloseHandle(readyEvent);
+        return (int)errorCode;
+    }
+    if (_wcsicmp(oldProcessPath, targetPath) != 0) {
+        CloseHandle(oldProcess);
+        CloseHandle(readyEvent);
+        return ERROR_INVALID_DATA;
+    }
+
+    wchar_t helperPath[MAX_PATH];
+    DWORD helperPathLength = GetModuleFileNameW(NULL, helperPath,
+                                               sizeof(helperPath) / sizeof(wchar_t));
+    DWORD binaryType = 0;
+    if (helperPathLength == 0 || helperPathLength >= MAX_PATH ||
+        !ValidateUpdateTempFilePair(helperPath, stagedPath, oldProcessId)) {
+        CloseHandle(oldProcess);
+        CloseHandle(readyEvent);
+        return ERROR_INVALID_DATA;
+    }
+    if (!GetBinaryTypeW(stagedPath, &binaryType)) {
+        DWORD errorCode = GetLastError();
+        CloseHandle(oldProcess);
+        CloseHandle(readyEvent);
+        return (int)errorCode;
+    }
+    if (binaryType != SCS_64BIT_BINARY) {
+        CloseHandle(oldProcess);
+        CloseHandle(readyEvent);
+        return ERROR_BAD_EXE_FORMAT;
+    }
+
+    // The helper is elevated only for file replacement. Preserve a primary
+    // token from the original process so the restarted launcher normally
+    // returns to the user's non-elevated session.
+    HANDLE launchToken = DuplicateUpdateLaunchToken(oldProcess);
+
+    // Only let the parent exit once this helper has verified every path and
+    // owns the process handle it must wait on.
+    if (!SetEvent(readyEvent)) {
+        DWORD errorCode = GetLastError();
+        CloseHandle(oldProcess);
+        CloseHandle(readyEvent);
+        if (launchToken) CloseHandle(launchToken);
+        return (int)errorCode;
+    }
+    CloseHandle(readyEvent);
+
+    DWORD waitResult = WaitForSingleObject(oldProcess, UPDATE_HELPER_WAIT_MS);
+    CloseHandle(oldProcess);
+    if (waitResult != WAIT_OBJECT_0) {
+        if (launchToken) CloseHandle(launchToken);
+        DeleteUpdateTempFile(stagedPath);
+        SetFileAttributesW(helperPath, FILE_ATTRIBUTE_NORMAL);
+        MoveFileExW(helperPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+        MessageBoxW(NULL, L"The running application did not close in time.",
+                    APP_NAME L" Update", MB_OK | MB_ICONERROR);
+        return ERROR_TIMEOUT;
+    }
+
+    wchar_t replacementPath[MAX_PATH], backupPath[MAX_PATH];
+    DWORD helperProcessId = GetCurrentProcessId();
+    int replacementLength = swprintf_s(replacementPath,
+        sizeof(replacementPath) / sizeof(wchar_t), L"%s.new.%lu.exe",
+        targetPath, (unsigned long)helperProcessId);
+    int backupLength = swprintf_s(backupPath,
+        sizeof(backupPath) / sizeof(wchar_t), L"%s.backup.%lu.exe",
+        targetPath, (unsigned long)helperProcessId);
+    if (replacementLength <= 0 || replacementLength >= MAX_PATH ||
+        backupLength <= 0 || backupLength >= MAX_PATH) {
+        return RestartAfterUpdateFailure(targetPath, stagedPath, helperPath,
+            oldProcessId, launchToken,
+            L"The update paths were too long. The previous version will restart.");
+    }
+
+    SetFileAttributesW(replacementPath, FILE_ATTRIBUTE_NORMAL);
+    DeleteFileW(replacementPath);
+    SetFileAttributesW(backupPath, FILE_ATTRIBUTE_NORMAL);
+    DeleteFileW(backupPath);
+    if (!CopyFileW(stagedPath, replacementPath, FALSE)) {
+        return RestartAfterUpdateFailure(targetPath, stagedPath, helperPath,
+            oldProcessId, launchToken,
+            L"The update could not be prepared. The previous version will restart.");
+    }
+
+    DWORD targetAttributes = GetFileAttributesW(targetPath);
+    BOOL clearedReadOnly = FALSE;
+    if (targetAttributes != INVALID_FILE_ATTRIBUTES &&
+        (targetAttributes & FILE_ATTRIBUTE_READONLY)) {
+        clearedReadOnly = SetFileAttributesW(
+            targetPath, targetAttributes & ~FILE_ATTRIBUTE_READONLY);
+    }
+    if (!ReplaceFileW(targetPath, replacementPath, backupPath,
+                      REPLACEFILE_WRITE_THROUGH, NULL, NULL)) {
+        if (clearedReadOnly) SetFileAttributesW(targetPath, targetAttributes);
+        DeleteFileW(replacementPath);
+        return RestartAfterUpdateFailure(targetPath, stagedPath, helperPath,
+            oldProcessId, launchToken,
+            L"The executable could not be replaced. The previous version will restart.");
+    }
+
+    if (!LaunchUpdateTarget(targetPath, stagedPath, helperPath,
+                            helperProcessId, oldProcessId, launchToken, TRUE)) {
+        DeleteFileW(targetPath);
+        if (!MoveFileExW(backupPath, targetPath,
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            if (launchToken) CloseHandle(launchToken);
+            DeleteUpdateTempFile(stagedPath);
+            SetFileAttributesW(helperPath, FILE_ATTRIBUTE_NORMAL);
+            MoveFileExW(helperPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+            MessageBoxW(NULL,
+                L"The updated application could not start and the previous executable "
+                L"could not be restored. A backup remains beside the application.",
+                APP_NAME L" Update", MB_OK | MB_ICONERROR);
+            return 1;
+        }
+        return RestartAfterUpdateFailure(targetPath, stagedPath, helperPath,
+            oldProcessId, launchToken,
+            L"The updated application could not start. The previous version was restored.");
+    }
+    if (launchToken) CloseHandle(launchToken);
+
+    if (!DeleteFileW(backupPath)) {
+        MoveFileExW(backupPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+    }
+    DeleteUpdateTempFile(stagedPath);
+    SetFileAttributesW(helperPath, FILE_ATTRIBUTE_NORMAL);
+    MoveFileExW(helperPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+    return 0;
+}
+
+static BOOL FinishUpdateCleanup(DWORD helperProcessId, DWORD oldProcessId,
+                                LPCWSTR stagedPath, LPCWSTR helperPath) {
+    wchar_t targetPath[MAX_PATH], expectedStagedPath[MAX_PATH];
+    wchar_t expectedHelperPath[MAX_PATH];
+    DWORD targetLength = GetModuleFileNameW(NULL, targetPath,
+                                           sizeof(targetPath) / sizeof(wchar_t));
+    if (targetLength == 0 || targetLength >= MAX_PATH ||
+        !BuildUpdateTempPath(expectedStagedPath, L"download", oldProcessId) ||
+        !BuildUpdateTempPath(expectedHelperPath, L"updater", oldProcessId) ||
+        _wcsicmp(stagedPath, expectedStagedPath) != 0 ||
+        _wcsicmp(helperPath, expectedHelperPath) != 0) {
+        return FALSE;
+    }
+
+    HANDLE helperProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                                       FALSE, helperProcessId);
+    if (helperProcess) {
+        wchar_t runningHelperPath[MAX_PATH];
+        DWORD runningHelperPathLength = MAX_PATH;
+        if (QueryFullProcessImageNameW(helperProcess, 0, runningHelperPath,
+                                      &runningHelperPathLength) &&
+            _wcsicmp(runningHelperPath, helperPath) == 0) {
+            WaitForSingleObject(helperProcess, UPDATE_HELPER_WAIT_MS);
+        }
+        CloseHandle(helperProcess);
+    }
+    for (int attempt = 0;
+         attempt < 20 && !DeleteUpdateTempFile(stagedPath);
+         ++attempt) {
+        Sleep(100);
+    }
+    for (int attempt = 0;
+         attempt < 20 && !DeleteUpdateTempFile(helperPath);
+         ++attempt) {
+        Sleep(100);
+    }
+    return TRUE;
+}
+
+// Returns an exit code and sets handled for the temporary updater process.
+// Both finish modes perform cleanup and continue normal application startup;
+// updateCompleted identifies only a successful executable replacement.
+static int HandleUpdateCommandLine(BOOL* handled, BOOL* updateCompleted) {
+    if (handled) *handled = FALSE;
+    if (updateCompleted) *updateCompleted = FALSE;
+    int argumentCount = 0;
+    LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
+    if (!arguments) return 0;
+
+    int result = 0;
+    if (argumentCount == 6 && wcscmp(arguments[1], L"--apply-update") == 0) {
+        DWORD oldProcessId = 0;
+        if (handled) *handled = TRUE;
+        if (!ParseUpdateProcessId(arguments[2], &oldProcessId)) {
+            result = ERROR_INVALID_PARAMETER;
+        } else {
+            result = RunUpdateApplyHelper(oldProcessId, arguments[3],
+                                          arguments[4], arguments[5]);
+        }
+    } else if (argumentCount == 6 &&
+               (wcscmp(arguments[1], L"--finish-update") == 0 ||
+                wcscmp(arguments[1], L"--finish-update-cleanup") == 0)) {
+        DWORD helperProcessId = 0, oldProcessId = 0;
+        if (ParseUpdateProcessId(arguments[2], &helperProcessId) &&
+            ParseUpdateProcessId(arguments[3], &oldProcessId)) {
+            BOOL recognizedHandoff = FinishUpdateCleanup(
+                helperProcessId, oldProcessId, arguments[4], arguments[5]);
+            if (recognizedHandoff && updateCompleted &&
+                wcscmp(arguments[1], L"--finish-update") == 0) {
+                *updateCompleted = TRUE;
+            }
+        }
+    }
+    LocalFree(arguments);
+    return result;
+}
+
+static void CfgSendUpdateResultWithVersions(LPCWSTR status, LPCWSTR title,
+                                            LPCWSTR message,
+                                            LPCWSTR currentVersion,
+                                            LPCWSTR remoteVersion,
+                                            BOOL automatic) {
+    if (!g_webviewView || !status || !title || !message ||
+        !currentVersion || !remoteVersion) return;
+    wchar_t escapedStatus[64], escapedTitle[256], escapedMessage[1024];
+    wchar_t escapedCurrentVersion[64], escapedRemoteVersion[64];
+    json_escape_wstring(status, escapedStatus,
+                        sizeof(escapedStatus) / sizeof(wchar_t));
+    json_escape_wstring(title, escapedTitle,
+                        sizeof(escapedTitle) / sizeof(wchar_t));
+    json_escape_wstring(message, escapedMessage,
+                        sizeof(escapedMessage) / sizeof(wchar_t));
+    json_escape_wstring(currentVersion, escapedCurrentVersion,
+                        sizeof(escapedCurrentVersion) / sizeof(wchar_t));
+    json_escape_wstring(remoteVersion, escapedRemoteVersion,
+                        sizeof(escapedRemoteVersion) / sizeof(wchar_t));
+
+    wchar_t script[1792];
+    int written = swprintf_s(script, sizeof(script) / sizeof(wchar_t),
+        L"window.onUpdateResult({\"status\":\"%s\",\"title\":\"%s\","
+        L"\"message\":\"%s\",\"currentVersion\":\"%s\","
+        L"\"remoteVersion\":\"%s\",\"automatic\":%s})",
+        escapedStatus, escapedTitle, escapedMessage,
+        escapedCurrentVersion, escapedRemoteVersion,
+        automatic ? L"true" : L"false");
+    if (written > 0) webview_execute_script(script);
+}
+
+static void CfgSendUpdateResult(LPCWSTR status, LPCWSTR title, LPCWSTR message) {
+    CfgSendUpdateResultWithVersions(status, title, message, L"", L"", FALSE);
+}
+
+static void CfgSendUpdateProgress(DWORD speedKbps) {
+    wchar_t script[160];
+    int written = swprintf_s(script, sizeof(script) / sizeof(wchar_t),
+        L"window.onUpdateProgress({\"kilobytesPerSecond\":%lu})",
+        (unsigned long)speedKbps);
+    if (written > 0) webview_execute_script(script);
+}
+
+static void DiscardPendingUpdateNotice(void) {
+    UpdateCheckTask* task = g_updateNoticeTask;
+    g_updateNoticeTask = NULL;
+    DiscardUpdateTask(task);
+}
+
+static void StartUpdateCheck(BOOL automatic) {
+    HWND targetWindow = g_hwnd ? g_hwnd : g_webviewHwnd;
+    if (!targetWindow) return;
+    if (automatic && (g_updateNoticeTask || g_updateReadyTask)) return;
+    if (InterlockedCompareExchangePointer(
+            (PVOID volatile*)&g_updatePostedResult, NULL, NULL) != NULL) {
+        if (!automatic) {
+            CfgSendUpdateResult(L"error", L"Update check in progress",
+                L"Another update check is still finishing. Try again shortly.");
+        }
+        return;
+    }
+    if (InterlockedCompareExchange(&g_updateCheckPending, TRUE, FALSE) != FALSE) {
+        if (!automatic) {
+            CfgSendUpdateResult(L"error", L"Update check in progress",
+                L"Another update check is still finishing. Try again shortly.");
+        }
+        return;
+    }
+    InterlockedExchange(&g_updateCheckAutomatic, automatic ? TRUE : FALSE);
+
+    // Every accepted request starts from scratch. Automatic requests are
+    // skipped above while a result is awaiting user action, avoiding an
+    // hourly re-download of the same prepared executable.
+    DiscardPendingUpdateNotice();
+    DiscardPreparedUpdate();
+
+    if (!g_updateCancelEvent) {
+        g_updateCancelEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!g_updateCancelEvent) {
+            DWORD errorCode = GetLastError();
+            InterlockedExchange(&g_updateCheckPending, FALSE);
+            InterlockedExchange(&g_updateCheckAutomatic, FALSE);
+            wchar_t message[256];
+            swprintf_s(message, sizeof(message) / sizeof(wchar_t),
+                L"Could not initialize update cancellation (Windows error %lu).",
+                (unsigned long)errorCode);
+            CfgSendUpdateResultWithVersions(L"error", L"Update failed", message,
+                                            L"", L"", automatic);
+            return;
+        }
+    }
+    ResetEvent(g_updateCancelEvent);
+    InterlockedExchange(&g_updateSpeedKbps, 0);
+    InterlockedExchange(&g_updateProgressPosted, FALSE);
+
+    UpdateCheckTask* task = (UpdateCheckTask*)calloc(1, sizeof(UpdateCheckTask));
+    if (!task) {
+        InterlockedExchange(&g_updateCheckPending, FALSE);
+        InterlockedExchange(&g_updateCheckAutomatic, FALSE);
+        CfgSendUpdateResultWithVersions(L"error", L"Update failed",
+            L"There was not enough memory to check for updates.",
+            L"", L"", automatic);
+        return;
+    }
+    task->targetWindow = targetWindow;
+    task->automatic = automatic;
+    LONG sequence = InterlockedIncrement(&g_updateRequestSequence);
+    task->cacheBuster =
+        ((GetTickCount64() ^ GetCurrentProcessId()) << 32) | (DWORD)sequence;
+    if (task->cacheBuster == 0) task->cacheBuster = 1;
+
+    HANDLE thread = CreateThread(NULL, 0, UpdateCheckThread, task, 0, NULL);
+    if (!thread) {
+        DWORD errorCode = GetLastError();
+        free(task);
+        InterlockedExchange(&g_updateCheckPending, FALSE);
+        InterlockedExchange(&g_updateCheckAutomatic, FALSE);
+        wchar_t message[256];
+        swprintf_s(message, sizeof(message) / sizeof(wchar_t),
+                   L"Could not start the update check (Windows error %lu).",
+                   (unsigned long)errorCode);
+        CfgSendUpdateResultWithVersions(L"error", L"Update failed", message,
+                                        L"", L"", automatic);
+        return;
+    }
+    CloseHandle(thread);
+}
+
+static BOOL IsIgnoredUpdateVersion(const ExecutableVersion* version) {
+    wchar_t formatted[32];
+    if (!version || !g_ignoredUpdateVersion[0]) return FALSE;
+    FormatExecutableVersion(version, formatted,
+                            sizeof(formatted) / sizeof(wchar_t));
+    return wcscmp(formatted, g_ignoredUpdateVersion) == 0;
+}
+
+static void SaveIgnoredUpdateVersion(LPCWSTR version) {
+    HKEY key;
+    DWORD disposition;
+    if (!version) return;
+    wcsncpy_s(g_ignoredUpdateVersion,
+              sizeof(g_ignoredUpdateVersion) / sizeof(wchar_t), version,
+              _TRUNCATE);
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH_W, 0, NULL,
+                        REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &key,
+                        &disposition) == ERROR_SUCCESS) {
+        RegSetValueExW(key, REG_VALUE_IGNORED_UPDATE_VERSION_W, 0, REG_SZ,
+                       (const BYTE*)g_ignoredUpdateVersion,
+                       (DWORD)((wcslen(g_ignoredUpdateVersion) + 1) *
+                               sizeof(wchar_t)));
+        RegCloseKey(key);
+    }
+}
+
+static void PresentPendingUpdateNotice(void) {
+    if (!g_configViewReady || !g_webviewView || !g_updateNoticeTask) return;
+
+    UpdateCheckTask* task = g_updateNoticeTask;
+    g_updateNoticeTask = NULL;
+    LPCWSTR status = NULL;
+    LPCWSTR title = NULL;
+    LPCWSTR message = NULL;
+    wchar_t currentVersion[32] = L"";
+    wchar_t remoteVersion[32] = L"";
+    BOOL installable = FALSE;
+
+    if (task->kind == UPDATE_CHECK_CANCELLED) {
+        status = L"cancelled";
+        title = L"";
+        message = L"";
+    } else if (task->kind == UPDATE_CHECK_ERROR) {
+        status = L"error";
+        title = L"Update failed";
+        message = task->message;
+    } else {
+        FormatExecutableVersionForDisplay(
+            &task->runningVersion, currentVersion,
+            sizeof(currentVersion) / sizeof(wchar_t));
+        FormatExecutableVersionForDisplay(
+            &task->availableVersion, remoteVersion,
+            sizeof(remoteVersion) / sizeof(wchar_t));
+        if (task->kind == UPDATE_CHECK_NEWER) {
+            status = L"newer";
+            title = L"Update available";
+            message = L"A newer version is ready to install.";
+            installable = TRUE;
+        } else if (task->kind == UPDATE_CHECK_SAME) {
+            status = L"same";
+            title = L"You're up to date";
+            message = L"The remote build matches your current version. "
+                      L"You can force a reinstall if needed.";
+            installable = !task->automatic;
+        } else if (task->kind == UPDATE_CHECK_OLDER) {
+            status = L"older";
+            title = L"No update available";
+            message = L"The remote build is older than your current version.";
+        }
+    }
+
+    if (!status) {
+        DiscardUpdateTask(task);
+        return;
+    }
+    if (installable) {
+        DiscardPreparedUpdate();
+        g_updateReadyTask = task;
+    }
+    CfgSendUpdateResultWithVersions(status, title, message,
+                                    currentVersion, remoteVersion,
+                                    task->automatic);
+    if (!installable) DiscardUpdateTask(task);
+}
+
+static void QueueUpdateNotice(UpdateCheckTask* task) {
+    DiscardPendingUpdateNotice();
+    g_updateNoticeTask = task;
+    PresentPendingUpdateNotice();
+}
+
+static void HandleCompletedUpdateCheck(UpdateCheckTask* task) {
+    if (!task) return;
+    InterlockedExchange(&g_updateProgressPosted, FALSE);
+    InterlockedExchange(&g_updateSpeedKbps, 0);
+
+    if (task->kind == UPDATE_CHECK_CANCELLED) {
+        LogUpdateMessage(L"[INFO] Update check cancelled\n");
+    } else if (task->kind == UPDATE_CHECK_ERROR) {
+        LogUpdateMessage(L"[WARNING] Update check failed: %s\n", task->message);
+    }
+
+    if (task->automatic && !configAutoCheckForUpdates) {
+        DiscardUpdateTask(task);
+        return;
+    }
+
+    if (task->automatic && task->kind == UPDATE_CHECK_NEWER &&
+        IsIgnoredUpdateVersion(&task->availableVersion)) {
+        LogUpdateMessage(L"[INFO] Automatic update prompt suppressed for ignored version\n");
+        task->kind = UPDATE_CHECK_CANCELLED;
+        if (g_webviewHwnd) {
+            QueueUpdateNotice(task);
+        } else {
+            DiscardUpdateTask(task);
+        }
+        return;
+    }
+
+    if (task->automatic && task->kind == UPDATE_CHECK_NEWER) {
+        if (g_webviewHwnd && strcmp(g_pendingView, "config") != 0) {
+            SendMessageW(g_webviewHwnd, WM_CLOSE, 0, 0);
+        }
+        QueueUpdateNotice(task);
+        ShowConfigDialog(g_hwnd);
+        if (!g_webviewHwnd) DiscardPendingUpdateNotice();
+        return;
+    }
+
+    if (g_webviewHwnd) {
+        QueueUpdateNotice(task);
+    } else {
+        DiscardUpdateTask(task);
+    }
+}
+
+static void IgnorePreparedUpdateVersion(const char* requestedVersion) {
+    UpdateCheckTask* task = g_updateReadyTask;
+    wchar_t preparedVersion[32];
+    wchar_t preparedDisplayVersion[32];
+    wchar_t requestedVersionW[32] = L"";
+    if (!task || !task->automatic || task->kind != UPDATE_CHECK_NEWER ||
+        !requestedVersion ||
+        !MultiByteToWideChar(CP_UTF8, 0, requestedVersion, -1,
+                             requestedVersionW,
+                             sizeof(requestedVersionW) / sizeof(wchar_t))) {
+        CfgSendUpdateResult(L"error", L"Update unavailable",
+            L"The update version could not be ignored. Check for updates again.");
+        return;
+    }
+    FormatExecutableVersion(&task->availableVersion, preparedVersion,
+                            sizeof(preparedVersion) / sizeof(wchar_t));
+    FormatExecutableVersionForDisplay(
+        &task->availableVersion, preparedDisplayVersion,
+        sizeof(preparedDisplayVersion) / sizeof(wchar_t));
+    if (wcscmp(preparedDisplayVersion, requestedVersionW) != 0) {
+        CfgSendUpdateResult(L"error", L"Update unavailable",
+            L"The update version changed. Check for updates again.");
+        return;
+    }
+    SaveIgnoredUpdateVersion(preparedVersion);
+    LogUpdateMessage(L"[INFO] Automatic update version added to the ignore list\n");
+    DiscardPreparedUpdate();
+}
+
+static void CancelUpdateCheck(void) {
+    if (InterlockedCompareExchange(&g_updateCheckPending, FALSE, FALSE) == TRUE &&
+        g_updateCancelEvent) {
+        LogUpdateMessage(L"[INFO] Update check cancellation requested\n");
+        SetEvent(g_updateCancelEvent);
+    }
+}
+
+static HANDLE CreateUpdateReadyEvent(DWORD processId, wchar_t* eventName,
+                                     size_t eventNameCch) {
+    if (!processId || !eventName || eventNameCch < 96) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+
+    ULONGLONG nonce = GetTickCount64() ^
+                      ((ULONGLONG)GetCurrentThreadId() << 32);
+    BCryptGenRandom(NULL, (PUCHAR)&nonce, sizeof(nonce),
+                    BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    int nameLength = swprintf_s(eventName, eventNameCch,
+        L"Local\\APIMonitor_UpdateReady_%lu_%016llx",
+        (unsigned long)processId, (unsigned long long)nonce);
+    if (nameLength <= 0 || nameLength >= (int)eventNameCch) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return NULL;
+    }
+
+    // The elevated helper can run with a split administrator token (or with
+    // alternate administrator credentials). Grant interactive users access
+    // to this random, session-local event so either UAC path can acknowledge
+    // readiness without exposing any file or process permissions.
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;GA;;;IU)(A;;GA;;;BA)(A;;GA;;;SY)",
+            SDDL_REVISION_1, &descriptor, NULL)) {
+        return NULL;
+    }
+    SECURITY_ATTRIBUTES securityAttributes = {0};
+    securityAttributes.nLength = sizeof(securityAttributes);
+    securityAttributes.lpSecurityDescriptor = descriptor;
+
+    HANDLE readyEvent = CreateEventW(&securityAttributes, TRUE, FALSE,
+                                     eventName);
+    DWORD errorCode = readyEvent ? ERROR_SUCCESS : GetLastError();
+    LocalFree(descriptor);
+    if (!readyEvent) SetLastError(errorCode);
+    return readyEvent;
+}
+
+static BOOL LaunchStagedUpdate(LPCWSTR stagedPath, LPCWSTR targetPath) {
+    if (!stagedPath || !targetPath || !*stagedPath || !*targetPath) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    DWORD oldProcessId = GetCurrentProcessId();
+    wchar_t helperPath[MAX_PATH];
+    if (!BuildUpdateTempPath(helperPath, L"updater", oldProcessId)) {
+        return FALSE;
+    }
+    DeleteUpdateTempFile(helperPath);
+    if (!CopyFileW(targetPath, helperPath, TRUE)) return FALSE;
+    SetFileAttributesW(helperPath, FILE_ATTRIBUTE_NORMAL);
+
+    // CopyFile preserves alternate data streams. The source is already the
+    // running, user-approved executable, so do not carry its download-zone
+    // marker onto the short-lived updater copy and trigger a second warning.
+    wchar_t zonePath[MAX_PATH + 32];
+    if (swprintf_s(zonePath, sizeof(zonePath) / sizeof(wchar_t),
+                   L"%s:Zone.Identifier", helperPath) > 0) {
+        DeleteFileW(zonePath);
+    }
+
+    wchar_t readyEventName[160];
+    HANDLE readyEvent = CreateUpdateReadyEvent(oldProcessId, readyEventName,
+        sizeof(readyEventName) / sizeof(wchar_t));
+    if (!readyEvent) {
+        DWORD errorCode = GetLastError();
+        DeleteUpdateTempFile(helperPath);
+        SetLastError(errorCode);
+        return FALSE;
+    }
+
+    wchar_t parameters[MAX_PATH * 2 + 512];
+    int parameterLength = swprintf_s(parameters,
+        sizeof(parameters) / sizeof(wchar_t),
+        L"--apply-update %lu \"%s\" \"%s\" \"%s\"",
+        (unsigned long)oldProcessId, readyEventName, targetPath, stagedPath);
+    if (parameterLength <= 0 ||
+        parameterLength >= (int)(sizeof(parameters) / sizeof(wchar_t))) {
+        CloseHandle(readyEvent);
+        DeleteUpdateTempFile(helperPath);
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+    SHELLEXECUTEINFOW executeInfo = {0};
+    executeInfo.cbSize = sizeof(executeInfo);
+    executeInfo.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    executeInfo.hwnd = g_webviewHwnd;
+    executeInfo.lpVerb = L"runas";
+    executeInfo.lpFile = helperPath;
+    executeInfo.lpParameters = parameters;
+    executeInfo.nShow = SW_HIDE;
+    BOOL elevated = ShellExecuteExW(&executeInfo);
+    if (!elevated || !executeInfo.hProcess) {
+        DWORD errorCode = elevated ? ERROR_INVALID_HANDLE : GetLastError();
+        if (!errorCode) errorCode = ERROR_ACCESS_DENIED;
+        CloseHandle(readyEvent);
+        DeleteUpdateTempFile(helperPath);
+        SetLastError(errorCode);
+        return FALSE;
+    }
+
+    HANDLE waitHandles[2] = { readyEvent, executeInfo.hProcess };
+    DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE,
+                                              UPDATE_HELPER_READY_MS);
+    DWORD errorCode = ERROR_SUCCESS;
+    if (waitResult != WAIT_OBJECT_0) {
+        if (waitResult == WAIT_OBJECT_0 + 1) {
+            DWORD exitCode = ERROR_INSTALL_FAILURE;
+            if (!GetExitCodeProcess(executeInfo.hProcess, &exitCode) ||
+                exitCode == ERROR_SUCCESS || exitCode == STILL_ACTIVE) {
+                exitCode = ERROR_INSTALL_FAILURE;
+            }
+            errorCode = exitCode;
+        } else {
+            errorCode = waitResult == WAIT_TIMEOUT ? ERROR_TIMEOUT
+                                                   : GetLastError();
+            if (!errorCode) errorCode = ERROR_INSTALL_FAILURE;
+        }
+    }
+    CloseHandle(executeInfo.hProcess);
+    CloseHandle(readyEvent);
+
+    if (waitResult != WAIT_OBJECT_0) {
+        DeleteUpdateTempFile(helperPath);
+        SetLastError(errorCode);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void DiscardPreparedUpdate(void) {
+    UpdateCheckTask* task = g_updateReadyTask;
+    g_updateReadyTask = NULL;
+    DiscardUpdateTask(task);
+}
+
+static void InstallPreparedUpdate(void) {
+    UpdateCheckTask* task = g_updateReadyTask;
+    g_updateReadyTask = NULL;
+    if (!task || (task->kind != UPDATE_CHECK_NEWER &&
+                  task->kind != UPDATE_CHECK_SAME)) {
+        DiscardUpdateTask(task);
+        CfgSendUpdateResult(L"error", L"Update unavailable",
+            L"The prepared update is no longer available. Check for updates again.");
+        return;
+    }
+
+    if (LaunchStagedUpdate(task->stagedPath, task->targetPath)) {
+        LogUpdateMessage(L"[INFO] Update accepted; exiting for replacement\n");
+        g_updateInstallReady = TRUE;
+        free(task);  // The updater process now owns the staged file.
+        if (g_webviewHwnd) PostMessageW(g_webviewHwnd, WM_CLOSE, 0, 0);
+        return;
+    }
+
+    DWORD errorCode = GetLastError();
+    wchar_t message[384];
+    LPCWSTR title = L"Update failed";
+    if (errorCode == ERROR_CANCELLED) {
+        title = L"Update cancelled";
+        wcscpy_s(message, sizeof(message) / sizeof(wchar_t),
+            L"Administrator approval was cancelled. Your current version is still running.");
+    } else {
+        swprintf_s(message, sizeof(message) / sizeof(wchar_t),
+            L"The elevated update process could not be started (Windows error %lu).",
+            (unsigned long)errorCode);
+    }
+    LogUpdateMessage(L"[WARNING] %s\n", message);
+    CfgSendUpdateResult(L"error", title, message);
+    DiscardUpdateTask(task);
+}
+
+
 // Wide-char version of ApiResultToString
 static const wchar_t* ApiResultToStringW(ApiResult r) {
     switch (r) {
@@ -1865,12 +3443,28 @@ static void webview_push_init_config(void) {
     json_escape_string(configApiUrl, wUrl, 1024);
     wchar_t wLogPath[1024];
     json_escape_string(logFilePath, wLogPath, 1024);
-    wchar_t script[4096];
-    swprintf(script, 4096,
-        L"window.onInit({\"view\":\"config\",\"config\":{\"url\":\"%s\",\"interval\":%d,\"loggingEnabled\":%s,\"historyLimit\":%d,\"logPath\":\"%s\"}})",
+    wchar_t wWebView2Version[256];
+    wchar_t wUpdateCompletedVersion[64];
+    json_escape_wstring(g_webView2Version, wWebView2Version,
+                        sizeof(wWebView2Version) / sizeof(wchar_t));
+    json_escape_wstring(g_updateConfirmationPending ? APP_VERSION_WSTRING : L"",
+                        wUpdateCompletedVersion,
+                        sizeof(wUpdateCompletedVersion) / sizeof(wchar_t));
+    BOOL updatePending =
+        InterlockedCompareExchange(&g_updateCheckPending, FALSE, FALSE) == TRUE ||
+        InterlockedCompareExchangePointer(
+            (PVOID volatile*)&g_updatePostedResult, NULL, NULL) != NULL;
+
+    wchar_t script[4608];
+    swprintf(script, sizeof(script) / sizeof(wchar_t),
+        L"window.onInit({\"view\":\"config\",\"config\":{\"url\":\"%s\",\"interval\":%d,\"loggingEnabled\":%s,\"historyLimit\":%d,\"logPath\":\"%s\",\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
         wUrl, configRefreshInterval,
         configLoggingEnabled ? L"true" : L"false",
-        configHistoryLimit, wLogPath);
+        configHistoryLimit, wLogPath,
+        configAutoCheckForUpdates ? L"true" : L"false",
+        updatePending ? L"true" : L"false",
+        g_updateNoticeTask ? L"true" : L"false",
+        wWebView2Version, wUpdateCompletedVersion);
     webview_execute_script(script);
 }
 
@@ -1963,6 +3557,15 @@ static HRESULT STDMETHODCALLTYPE EnvCompleted_Invoke(ICoreWebView2CreateCoreWebV
     if (FAILED(result) || !env) return result;
     g_webviewEnv = env;
     env->lpVtbl->AddRef(env);
+
+    LPWSTR browserVersion = NULL;
+    if (SUCCEEDED(env->lpVtbl->get_BrowserVersionString(env, &browserVersion)) &&
+        browserVersion && browserVersion[0]) {
+        wcsncpy_s(g_webView2Version,
+                  sizeof(g_webView2Version) / sizeof(wchar_t),
+                  browserVersion, _TRUNCATE);
+    }
+    CoTaskMemFree(browserVersion);
 
     static ControllerCompletedHandlerVtbl ctrlVtbl = {0};
     static BOOL ctrlVtblInit = FALSE;
@@ -2079,6 +3682,39 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         } else if (strcmp(g_pendingView, "history") == 0) {
             webview_push_init_history();
         }
+    } else if (strcmp(action, "configReady") == 0) {
+        if (g_webviewHwnd && strcmp(g_pendingView, "config") == 0) {
+            BOOL updateWorkAlreadyActive =
+                InterlockedCompareExchange(&g_updateCheckPending,
+                                           FALSE, FALSE) == TRUE ||
+                InterlockedCompareExchangePointer(
+                    (PVOID volatile*)&g_updatePostedResult, NULL, NULL) != NULL ||
+                g_updateNoticeTask || g_updateReadyTask;
+            BOOL checkAutomatically = FALSE;
+            json_get_bool(msg, "checkAutomatically", &checkAutomatically);
+            g_configViewReady = TRUE;
+            PresentPendingUpdateNotice();
+            if (checkAutomatically && configAutoCheckForUpdates &&
+                !g_updateConfirmationPending && !updateWorkAlreadyActive) {
+                StartUpdateCheck(TRUE);
+            }
+        }
+    } else if (strcmp(action, "checkUpdate") == 0) {
+        BOOL automatic = FALSE;
+        json_get_bool(msg, "automatic", &automatic);
+        StartUpdateCheck(automatic);
+    } else if (strcmp(action, "cancelUpdateCheck") == 0) {
+        CancelUpdateCheck();
+    } else if (strcmp(action, "installUpdate") == 0) {
+        InstallPreparedUpdate();
+    } else if (strcmp(action, "dismissUpdate") == 0) {
+        DiscardPreparedUpdate();
+    } else if (strcmp(action, "ignoreUpdateVersion") == 0) {
+        char version[32] = {0};
+        json_get_string(msg, "version", version, sizeof(version));
+        IgnorePreparedUpdateVersion(version);
+    } else if (strcmp(action, "dismissUpdateConfirmation") == 0) {
+        g_updateConfirmationPending = FALSE;
     } else if (strcmp(action, "validateUrl") == 0) {
         char url[512] = {0};
         json_get_string(msg, "url", url, sizeof(url));
@@ -2089,10 +3725,12 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         char url[512] = {0};
         int interval = 60;
         BOOL logging = TRUE;
+        BOOL autoUpdate = configAutoCheckForUpdates;
         int histLimit = 100;
         json_get_string(msg, "url", url, sizeof(url));
         json_get_int(msg, "interval", &interval);
         json_get_bool(msg, "loggingEnabled", &logging);
+        json_get_bool(msg, "autoCheckForUpdates", &autoUpdate);
         json_get_int(msg, "historyLimit", &histLimit);
 
         if (url[0]) {
@@ -2103,6 +3741,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
             configRefreshInterval = interval;
         }
         configLoggingEnabled = logging;
+        configAutoCheckForUpdates = autoUpdate;
         if (histLimit >= 10 && histLimit <= 10000) {
             configHistoryLimit = histLimit;
             InitHistoryBuffer(configHistoryLimit);
@@ -2111,8 +3750,10 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         SaveConfigToRegistry();
         MarkAsConfigured();
         ApplyConfiguration();
-        LogMessage("Configuration updated via WebView dialog: URL=%s, Interval=%d, Logging=%s, HistoryLimit=%d",
-                   configApiUrl, configRefreshInterval, configLoggingEnabled ? "enabled" : "disabled", configHistoryLimit);
+        LogMessage("Configuration updated via WebView dialog: URL=%s, Interval=%d, Logging=%s, HistoryLimit=%d, AutoUpdate=%s",
+                   configApiUrl, configRefreshInterval,
+                   configLoggingEnabled ? "enabled" : "disabled", configHistoryLimit,
+                   configAutoCheckForUpdates ? "enabled" : "disabled");
         PostMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "close") == 0) {
         PostMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
@@ -2153,6 +3794,24 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
 
 static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_APP_UPDATE_PROGRESS:
+            InterlockedExchange(&g_updateProgressPosted, FALSE);
+            if (InterlockedCompareExchange(&g_updateCheckPending,
+                                           FALSE, FALSE) == TRUE &&
+                g_configViewReady) {
+                DWORD speedKbps = (DWORD)InterlockedCompareExchange(
+                    &g_updateSpeedKbps, 0, 0);
+                CfgSendUpdateProgress(speedKbps);
+            }
+            return 0;
+
+        case WM_APP_UPDATE_RESULT: {
+            UpdateCheckTask* task = (UpdateCheckTask*)InterlockedExchangePointer(
+                (PVOID volatile*)&g_updatePostedResult, NULL);
+            HandleCompletedUpdateCheck(task);
+            return 0;
+        }
+
         case WM_SIZE:
             webview_sync_controller_bounds();
             return 0;
@@ -2196,9 +3855,20 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             return 0;
 
         case WM_DESTROY:
+            if (InterlockedCompareExchange(&g_updateCheckPending,
+                                           FALSE, FALSE) == TRUE &&
+                InterlockedCompareExchange(&g_updateCheckAutomatic,
+                                           FALSE, FALSE) == FALSE &&
+                g_updateCancelEvent) {
+                SetEvent(g_updateCancelEvent);
+            }
+            DiscardPendingUpdateNotice();
+            DiscardPreparedUpdate();
             g_webviewHwnd = NULL;
             g_webviewWindowShown = FALSE;
+            g_configViewReady = FALSE;
             KillTimer(hwnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK);
+            if (g_updateInstallReady) PostQuitMessage(0);
             return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -2219,6 +3889,7 @@ static void ShowWebViewDialog(const char* view, int width, int height) {
 
     strncpy(g_pendingView, view, sizeof(g_pendingView) - 1);
     g_pendingView[sizeof(g_pendingView) - 1] = '\0';
+    g_configViewReady = FALSE;
 
     // Register window class (once)
     static BOOL classRegistered = FALSE;
@@ -2295,6 +3966,13 @@ void ExitApplication(HWND hwnd) {
     alreadyExiting = TRUE;
 
     LogMessage("=== Application shutting down ===");
+
+    KillTimer(hwnd, ID_TIMER_AUTO_UPDATE);
+    if (g_updateCancelEvent) SetEvent(g_updateCancelEvent);
+    DiscardUpdateTask((UpdateCheckTask*)InterlockedExchangePointer(
+        (PVOID volatile*)&g_updatePostedResult, NULL));
+    DiscardPendingUpdateNotice();
+    DiscardPreparedUpdate();
 
     // Close WebView2 dialog if open
     if (g_webviewHwnd) SendMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
