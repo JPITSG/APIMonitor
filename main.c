@@ -1693,47 +1693,38 @@ void UpdateStatus(ApiResult result, const char* message) {
 
 void UpdateTooltip() {
     char tooltip[128];
-    if (currentResult == RESULT_ERROR) {
-        strcpy(tooltip, "Unable to connect to API!");
-    } else if (currentResult == RESULT_INVALID) {
-        strcpy(tooltip, "API response incorrect!");
+    SYSTEMTIME now;
+    GetSystemTime(&now);
+
+    FILETIME ftLast, ftNow;
+    SystemTimeToFileTime(&lastUpdateTime, &ftLast);
+    SystemTimeToFileTime(&now, &ftNow);
+
+    ULARGE_INTEGER last, current;
+    last.LowPart = ftLast.dwLowDateTime;
+    last.HighPart = ftLast.dwHighDateTime;
+    current.LowPart = ftNow.dwLowDateTime;
+    current.HighPart = ftNow.dwHighDateTime;
+
+    ULONGLONG diff = (current.QuadPart - last.QuadPart) / 10000000;
+    const char* serverTime =
+        (currentResult == RESULT_ERROR || currentResult == RESULT_INVALID ||
+         currentMessage[0] == '\0')
+            ? "Unavailable"
+            : currentMessage;
+
+    if (diff == 1) {
+        snprintf(tooltip, sizeof(tooltip),
+                 "Updated: %I64u second ago\nServer time: %s",
+                 diff, serverTime);
     } else {
-        SYSTEMTIME now;
-        GetSystemTime(&now);
-
-        FILETIME ftLast, ftNow;
-        SystemTimeToFileTime(&lastUpdateTime, &ftLast);
-        SystemTimeToFileTime(&now, &ftNow);
-
-        ULARGE_INTEGER last, current;
-        last.LowPart = ftLast.dwLowDateTime;
-        last.HighPart = ftLast.dwHighDateTime;
-        current.LowPart = ftNow.dwLowDateTime;
-        current.HighPart = ftNow.dwHighDateTime;
-
-        ULONGLONG diff = (current.QuadPart - last.QuadPart) / 10000000;
-        if (diff == 1) {
-            snprintf(tooltip, sizeof(tooltip), "Updated %llu second ago", diff);
-        } else {
-            snprintf(tooltip, sizeof(tooltip), "Updated %llu seconds ago", diff);
-        }
-
-        if (strlen(currentMessage) > 0) {
-            size_t remaining = sizeof(tooltip) - strlen(tooltip) - 1;
-            strncat(tooltip, "\n", remaining);
-            remaining = sizeof(tooltip) - strlen(tooltip) - 1;
-            strncat(tooltip, currentMessage, remaining);
-        }
+        snprintf(tooltip, sizeof(tooltip),
+                 "Updated: %I64u seconds ago\nServer time: %s",
+                 diff, serverTime);
     }
 
-    if (strlen(tooltip) > 63) {
-        tooltip[60] = '.';
-        tooltip[61] = '.';
-        tooltip[62] = '.';
-        tooltip[63] = '\0';
-    }
-
-    strcpy(nid.szTip, tooltip);
+    strncpy(nid.szTip, tooltip, sizeof(nid.szTip) - 1);
+    nid.szTip[sizeof(nid.szTip) - 1] = '\0';
     nid.uFlags = NIF_TIP;
     Shell_NotifyIconA(NIM_MODIFY, &nid);
 }
