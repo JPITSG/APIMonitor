@@ -36,6 +36,7 @@
 #define REG_KEY_PATH        "SOFTWARE\\JPIT\\APIMonitor"
 #define REG_VALUE_URL       "ApiUrl"
 #define REG_VALUE_INTERVAL  "RefreshInterval"
+#define REG_VALUE_DOWN_INTERVAL "DownRefreshInterval"
 #define REG_VALUE_LOGGING   "LoggingEnabled"
 #define REG_VALUE_CONFIGURED "Configured"
 #define REG_VALUE_HISTORY_LIMIT "HistoryLimit"
@@ -48,7 +49,10 @@
 #define WM_VALIDATE_RESULT      (WM_APP + 1)
 #define WM_APP_UPDATE_RESULT    (WM_APP + 2)
 #define WM_APP_UPDATE_PROGRESS  (WM_APP + 3)
+#define WM_APP_REFRESH_COMPLETE (WM_APP + 4)
 #define WM_SHOW_FIRST_CONFIG    (WM_USER + 2)
+#define ID_TIMER_REFRESH 1
+#define ID_TIMER_TOOLTIP 2
 #define ID_TIMER_WEBVIEW_SHOW_FALLBACK 1006
 #define WEBVIEW_SHOW_FALLBACK_DELAY_MS 350
 #define ID_TIMER_AUTO_UPDATE 1007
@@ -77,6 +81,7 @@ typedef struct {
 typedef struct {
     int attempt;
     int maxAttempts;
+    char url[512];
 } ThreadParams;
 
 typedef struct {
@@ -92,6 +97,7 @@ static NOTIFYICONDATA nid = {0};
 static HMENU hMenu = NULL;
 static char configApiUrl[512] = "http://example.com/api/status";
 static int configRefreshInterval = 60;
+static int configDownRefreshInterval = 10;
 static char logFilePath[MAX_PATH];
 static HICON hIconEmpty = NULL;
 static HICON hIconSuccess = NULL;
@@ -124,6 +130,7 @@ typedef struct {
 } ValidateParams;
 
 static volatile LONG g_validateGeneration = 0;
+static volatile LONG g_refreshInProgress = FALSE;
 
 // Display settings tracking (for RDP reconnect icon refresh)
 static int lastScreenWidth = 0;
@@ -426,7 +433,8 @@ void CALLBACK RefreshTimer(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime)
 void ParseXmlResponse(const char* xml, ApiResponse* response);
 void ExitApplication(HWND hwnd);
 void UpdateTooltip();
-void SetRefreshInterval(int seconds, BOOL isUserSetting);
+static void ScheduleNextRefresh(ApiResult result);
+static void CompleteRefresh(ApiResult result);
 void CaptureCurrentDisplaySettings();
 BOOL HasDisplaySettingsChanged();
 void RefreshTrayIconForNewResolution();
@@ -569,8 +577,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         LogMessage("Migrated configuration from INI to registry.");
     }
 
-    LogMessage("Configuration loaded: URL=%s, Interval=%d, Logging=%s, HistoryLimit=%d",
-               configApiUrl, configRefreshInterval, configLoggingEnabled ? "enabled" : "disabled", configHistoryLimit);
+    LogMessage("Configuration loaded: URL=%s, HealthyInterval=%d, DownInterval=%d, Logging=%s, HistoryLimit=%d",
+               configApiUrl, configRefreshInterval, configDownRefreshInterval,
+               configLoggingEnabled ? "enabled" : "disabled", configHistoryLimit);
 
     // Initialize history buffer
     InitHistoryBuffer(configHistoryLimit);
@@ -637,15 +646,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     CreateContextMenu();
 
     // Set up timers
-    timerTooltip = SetTimer(hwnd, 2, 1000, TooltipTimer);
+    timerTooltip = SetTimer(hwnd, ID_TIMER_TOOLTIP, 1000, TooltipTimer);
 
     // Initial check
     LogMessage("Performing initial API check.");
     RefreshStatus();
-
-    // Start refresh timer
-    timerRefresh = SetTimer(hwnd, 1, configRefreshInterval * 1000, RefreshTimer);
-    LogMessage("Refresh timer started with %d second interval.", configRefreshInterval);
 
     // On first launch, post message to show config dialog after message loop starts
     if (firstLaunch) {
@@ -694,6 +699,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             HandleCompletedUpdateCheck(task);
             return 0;
         }
+
+        case WM_APP_REFRESH_COMPLETE:
+            if (InterlockedCompareExchange(&g_refreshInProgress,
+                                           FALSE, FALSE) == FALSE) {
+                ScheduleNextRefresh(currentResult);
+            } else {
+                LogMessage("Refresh completion arrived while a newer API check is running; scheduling deferred.");
+            }
+            return 0;
 
         case WM_SHOW_FIRST_CONFIG:
             ShowConfigDialog(g_hwnd);
@@ -748,8 +762,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             break;
 
         case WM_TIMER:
-            if (wParam == 1) RefreshTimer(hwnd, uMsg, wParam, 0);
-            else if (wParam == 2) TooltipTimer(hwnd, uMsg, wParam, 0);
+            if (wParam == ID_TIMER_REFRESH) RefreshTimer(hwnd, uMsg, wParam, 0);
+            else if (wParam == ID_TIMER_TOOLTIP) TooltipTimer(hwnd, uMsg, wParam, 0);
             else if (wParam == ID_TIMER_AUTO_UPDATE && configAutoCheckForUpdates) {
                 StartUpdateCheck(TRUE);
             }
@@ -812,8 +826,17 @@ BOOL LoadConfigFromRegistry() {
     DWORD dwInterval = 60;
     size = sizeof(dwInterval);
     if (RegQueryValueExA(hKey, REG_VALUE_INTERVAL, NULL, &type, (LPBYTE)&dwInterval, &size) == ERROR_SUCCESS
-        && type == REG_DWORD) {
+        && type == REG_DWORD && dwInterval >= 1 && dwInterval <= 86400) {
         configRefreshInterval = (int)dwInterval;
+    }
+
+    // Read DownRefreshInterval (REG_DWORD)
+    DWORD dwDownInterval = 10;
+    size = sizeof(dwDownInterval);
+    if (RegQueryValueExA(hKey, REG_VALUE_DOWN_INTERVAL, NULL, &type,
+                         (LPBYTE)&dwDownInterval, &size) == ERROR_SUCCESS
+        && type == REG_DWORD && dwDownInterval >= 1 && dwDownInterval <= 86400) {
+        configDownRefreshInterval = (int)dwDownInterval;
     }
 
     // Read LoggingEnabled (REG_DWORD)
@@ -877,6 +900,11 @@ void SaveConfigToRegistry() {
     RegSetValueExA(hKey, REG_VALUE_INTERVAL, 0, REG_DWORD,
                    (const BYTE*)&dwInterval, sizeof(dwInterval));
 
+    // Write DownRefreshInterval (REG_DWORD)
+    DWORD dwDownInterval = (DWORD)configDownRefreshInterval;
+    RegSetValueExA(hKey, REG_VALUE_DOWN_INTERVAL, 0, REG_DWORD,
+                   (const BYTE*)&dwDownInterval, sizeof(dwDownInterval));
+
     // Write LoggingEnabled (REG_DWORD)
     DWORD dwLogging = (DWORD)configLoggingEnabled;
     RegSetValueExA(hKey, REG_VALUE_LOGGING, 0, REG_DWORD,
@@ -892,8 +920,8 @@ void SaveConfigToRegistry() {
                    (const BYTE*)&dwAutoUpdate, sizeof(dwAutoUpdate));
 
     RegCloseKey(hKey);
-    LogMessage("Configuration saved to registry: URL=%s, Interval=%d, Logging=%s, HistoryLimit=%d, AutoUpdate=%s",
-               configApiUrl, configRefreshInterval,
+    LogMessage("Configuration saved to registry: URL=%s, HealthyInterval=%d, DownInterval=%d, Logging=%s, HistoryLimit=%d, AutoUpdate=%s",
+               configApiUrl, configRefreshInterval, configDownRefreshInterval,
                configLoggingEnabled ? "enabled" : "disabled", configHistoryLimit,
                configAutoCheckForUpdates ? "enabled" : "disabled");
 }
@@ -938,6 +966,9 @@ void LoadConfigFromIni(const char* iniPath) {
     GetPrivateProfileStringA("General", "ApiUrl", "http://example.com/api/status",
                             configApiUrl, sizeof(configApiUrl), iniPath);
     configRefreshInterval = GetPrivateProfileIntA("General", "RefreshInterval", 60, iniPath);
+    configDownRefreshInterval = GetPrivateProfileIntA("General", "DownRefreshInterval", 10, iniPath);
+    if (configRefreshInterval < 1 || configRefreshInterval > 86400) configRefreshInterval = 60;
+    if (configDownRefreshInterval < 1 || configDownRefreshInterval > 86400) configDownRefreshInterval = 10;
     configLoggingEnabled = (BOOL)GetPrivateProfileIntA("General", "LoggingEnabled", 1, iniPath);
 }
 
@@ -1126,12 +1157,10 @@ void LoadHistoryFromRegistry(void) {
 }
 
 void ApplyConfiguration() {
-    if (g_hwnd) {
-        if (timerRefresh) KillTimer(g_hwnd, 1);
-        timerRefresh = SetTimer(g_hwnd, 1, configRefreshInterval * 1000, RefreshTimer);
-    }
-    LogMessage("Configuration applied: URL=%s, Interval=%d, Logging=%s",
-               configApiUrl, configRefreshInterval, configLoggingEnabled ? "enabled" : "disabled");
+    ScheduleNextRefresh(currentResult);
+    LogMessage("Configuration applied: URL=%s, HealthyInterval=%d, DownInterval=%d, Logging=%s",
+               configApiUrl, configRefreshInterval, configDownRefreshInterval,
+               configLoggingEnabled ? "enabled" : "disabled");
 }
 
 // --- Configuration dialog ---
@@ -1293,37 +1322,83 @@ void ShowConfigDialog(HWND hwndParent) {
 
 // --- Timer and refresh ---
 
-void SetRefreshInterval(int seconds, BOOL isUserSetting) {
-    if (isUserSetting) {
-        configRefreshInterval = seconds;
-        SaveConfigToRegistry();
+static void ScheduleNextRefresh(ApiResult result) {
+    if (!g_hwnd) return;
 
-        if (currentResult != RESULT_SUCCESS) {
-            LogMessage("Interval change to %d seconds requested, but not applied due to non-success state.", seconds);
-            return;
-        }
+    if (timerRefresh) {
+        KillTimer(g_hwnd, ID_TIMER_REFRESH);
+        timerRefresh = 0;
     }
 
-    if (timerRefresh) KillTimer(g_hwnd, 1);
-    timerRefresh = SetTimer(g_hwnd, 1, seconds * 1000, RefreshTimer);
-    LogMessage("Refresh timer updated: %d seconds (userSetting=%s)", seconds, isUserSetting ? "true" : "false");
+    if (InterlockedCompareExchange(&g_refreshInProgress,
+                                   FALSE, FALSE) != FALSE) {
+        LogMessage("Next API check will be scheduled after the active check completes.");
+        return;
+    }
+
+    int seconds = result == RESULT_SUCCESS
+        ? configRefreshInterval
+        : configDownRefreshInterval;
+    if (seconds < 1 || seconds > 86400) {
+        seconds = result == RESULT_SUCCESS ? 60 : 10;
+    }
+
+    timerRefresh = SetTimer(g_hwnd, ID_TIMER_REFRESH,
+                            (UINT)seconds * 1000U, NULL);
+    if (timerRefresh) {
+        LogMessage("Next API check scheduled in %d seconds after completed result %s.",
+                   seconds, ApiResultToString(result));
+    } else {
+        LogMessage("ERROR: Failed to schedule the next API check.");
+    }
+}
+
+static void CompleteRefresh(ApiResult result) {
+    InterlockedExchange(&g_refreshInProgress, FALSE);
+    if (g_hwnd &&
+        !PostMessage(g_hwnd, WM_APP_REFRESH_COMPLETE, (WPARAM)result, 0)) {
+        LogMessage("ERROR: Failed to report API check completion to the main window.");
+    }
 }
 
 void RefreshStatus() {
     LogMessage("RefreshStatus() called.");
-    DWORD threadId;
+
+    if (timerRefresh && g_hwnd) {
+        KillTimer(g_hwnd, ID_TIMER_REFRESH);
+        timerRefresh = 0;
+    }
+
+    if (InterlockedCompareExchange(&g_refreshInProgress,
+                                   TRUE, FALSE) != FALSE) {
+        LogMessage("API check skipped because another check is already running.");
+        return;
+    }
 
     // Allocate thread parameters
     ThreadParams* params = (ThreadParams*)malloc(sizeof(ThreadParams));
     if (!params) {
         LogMessage("ERROR: Failed to allocate memory for thread parameters");
+        UpdateStatus(RESULT_ERROR, "Could not start API check");
+        CompleteRefresh(RESULT_ERROR);
         return;
     }
     params->attempt = 1;
     params->maxAttempts = 3;
+    strncpy(params->url, configApiUrl, sizeof(params->url) - 1);
+    params->url[sizeof(params->url) - 1] = '\0';
 
     // Create thread with parameters
-    CloseHandle(CreateThread(NULL, 0, RefreshThread, params, 0, &threadId));
+    HANDLE hThread = CreateThread(NULL, 0, RefreshThread, params, 0, NULL);
+    if (!hThread) {
+        DWORD error = GetLastError();
+        free(params);
+        LogMessage("ERROR: Failed to create API check thread. Error: %lu", error);
+        UpdateStatus(RESULT_ERROR, "Could not start API check");
+        CompleteRefresh(RESULT_ERROR);
+        return;
+    }
+    CloseHandle(hThread);
 }
 
 void ParseXmlResponse(const char* xml, ApiResponse* response) {
@@ -1425,12 +1500,10 @@ DWORD WINAPI RefreshThread(LPVOID param) {
     char response[4096] = {0};
 
     // Validate API URL
-    if (strlen(configApiUrl) == 0) {
+    if (strlen(params->url) == 0) {
         LogMessage("ERROR: API URL is not configured.");
         strncpy(finalMessage, "API URL not configured", sizeof(finalMessage) - 1);
-        UpdateStatus(RESULT_ERROR, finalMessage);
-        free(params);
-        return 0;
+        goto complete;
     }
 
     // Retry loop
@@ -1449,7 +1522,7 @@ DWORD WINAPI RefreshThread(LPVOID param) {
 
         // Parse URL (existing logic)
         char urlCopy[512];
-        strncpy(urlCopy, configApiUrl, sizeof(urlCopy) - 1);
+        strncpy(urlCopy, params->url, sizeof(urlCopy) - 1);
         urlCopy[sizeof(urlCopy) - 1] = '\0';
 
         char* protocol = NULL;
@@ -1642,12 +1715,14 @@ DWORD WINAPI RefreshThread(LPVOID param) {
         break; // Success or non-retryable error
     }
 
+complete:
     // Update the UI with final result
     UpdateStatus(finalResult, finalMessage);
 
     // Clean up parameters
     free(params);
     LogMessage("API refresh thread completed with result: %d", finalResult);
+    CompleteRefresh(finalResult);
     return 0;
 }
 
@@ -1671,22 +1746,20 @@ void UpdateStatus(ApiResult result, const char* message) {
         case RESULT_SUCCESS:
             LogMessage("Status update: SUCCESS - %s", message ? message : "No message");
             SetIcon(hIconSuccess);
-            SetRefreshInterval(configRefreshInterval, FALSE);
             break;
         case RESULT_FAIL:
             LogMessage("Status update: FAIL - %s", message ? message : "No message");
             SetIcon(hIconFail);
-            SetRefreshInterval(10, FALSE);
             break;
         case RESULT_ERROR:
             LogMessage("Status update: ERROR - %s", message ? message : "No message");
             SetIcon(hIconEmpty);
-            SetRefreshInterval(10, FALSE);
             break;
         case RESULT_INVALID:
             LogMessage("Status update: INVALID - %s", message ? message : "No message");
             SetIcon(hIconEmpty);
-            SetRefreshInterval(10, FALSE);
+            break;
+        case RESULT_NONE:
             break;
     }
 }
@@ -1757,11 +1830,12 @@ void CALLBACK TooltipTimer(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime)
 }
 
 void CALLBACK RefreshTimer(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime) {
-    UNREFERENCED_PARAMETER(hwnd);
     UNREFERENCED_PARAMETER(uMsg);
     UNREFERENCED_PARAMETER(idEvent);
     UNREFERENCED_PARAMETER(dwTime);
 
+    KillTimer(hwnd, ID_TIMER_REFRESH);
+    timerRefresh = 0;
     LogMessage("Scheduled refresh timer fired.");
     RefreshStatus();
 }
@@ -3448,8 +3522,8 @@ static void webview_push_init_config(void) {
 
     wchar_t script[4608];
     swprintf(script, sizeof(script) / sizeof(wchar_t),
-        L"window.onInit({\"view\":\"config\",\"config\":{\"url\":\"%s\",\"interval\":%d,\"loggingEnabled\":%s,\"historyLimit\":%d,\"logPath\":\"%s\",\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
-        wUrl, configRefreshInterval,
+        L"window.onInit({\"view\":\"config\",\"config\":{\"url\":\"%s\",\"healthyInterval\":%d,\"downInterval\":%d,\"loggingEnabled\":%s,\"historyLimit\":%d,\"logPath\":\"%s\",\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
+        wUrl, configRefreshInterval, configDownRefreshInterval,
         configLoggingEnabled ? L"true" : L"false",
         configHistoryLimit, wLogPath,
         configAutoCheckForUpdates ? L"true" : L"false",
@@ -3714,12 +3788,14 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         }
     } else if (strcmp(action, "saveSettings") == 0) {
         char url[512] = {0};
-        int interval = 60;
+        int healthyInterval = 60;
+        int downInterval = 10;
         BOOL logging = TRUE;
         BOOL autoUpdate = configAutoCheckForUpdates;
         int histLimit = 100;
         json_get_string(msg, "url", url, sizeof(url));
-        json_get_int(msg, "interval", &interval);
+        json_get_int(msg, "healthyInterval", &healthyInterval);
+        json_get_int(msg, "downInterval", &downInterval);
         json_get_bool(msg, "loggingEnabled", &logging);
         json_get_bool(msg, "autoCheckForUpdates", &autoUpdate);
         json_get_int(msg, "historyLimit", &histLimit);
@@ -3728,8 +3804,13 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
             strncpy(configApiUrl, url, sizeof(configApiUrl) - 1);
             configApiUrl[sizeof(configApiUrl) - 1] = '\0';
         }
-        if (interval == 60 || interval == 120 || interval == 300) {
-            configRefreshInterval = interval;
+        if (healthyInterval == 60 || healthyInterval == 120 ||
+            healthyInterval == 300) {
+            configRefreshInterval = healthyInterval;
+        }
+        if (downInterval == 10 || downInterval == 30 || downInterval == 60 ||
+            downInterval == 120 || downInterval == 300) {
+            configDownRefreshInterval = downInterval;
         }
         configLoggingEnabled = logging;
         configAutoCheckForUpdates = autoUpdate;
@@ -3741,8 +3822,8 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         SaveConfigToRegistry();
         MarkAsConfigured();
         ApplyConfiguration();
-        LogMessage("Configuration updated via WebView dialog: URL=%s, Interval=%d, Logging=%s, HistoryLimit=%d, AutoUpdate=%s",
-                   configApiUrl, configRefreshInterval,
+        LogMessage("Configuration updated via WebView dialog: URL=%s, HealthyInterval=%d, DownInterval=%d, Logging=%s, HistoryLimit=%d, AutoUpdate=%s",
+                   configApiUrl, configRefreshInterval, configDownRefreshInterval,
                    configLoggingEnabled ? "enabled" : "disabled", configHistoryLimit,
                    configAutoCheckForUpdates ? "enabled" : "disabled");
         PostMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
@@ -3968,8 +4049,8 @@ void ExitApplication(HWND hwnd) {
     // Close WebView2 dialog if open
     if (g_webviewHwnd) SendMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
 
-    if (timerRefresh) KillTimer(hwnd, 1);
-    if (timerTooltip) KillTimer(hwnd, 2);
+    if (timerRefresh) KillTimer(hwnd, ID_TIMER_REFRESH);
+    if (timerTooltip) KillTimer(hwnd, ID_TIMER_TOOLTIP);
 
     SaveHistoryToRegistry();
     FreeHistoryBuffer();

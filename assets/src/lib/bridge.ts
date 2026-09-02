@@ -1,6 +1,7 @@
 export interface ConfigData {
   url: string;
-  interval: number;
+  healthyInterval: number;
+  downInterval: number;
   loggingEnabled: boolean;
   historyLimit: number;
   logPath?: string;
@@ -140,7 +141,8 @@ export function saveSettings(config: ConfigData) {
   postMessage({
     action: "saveSettings",
     url: config.url,
-    interval: config.interval,
+    healthyInterval: config.healthyInterval,
+    downInterval: config.downInterval,
     loggingEnabled: config.loggingEnabled,
     historyLimit: config.historyLimit,
     autoCheckForUpdates: config.autoCheckForUpdates,

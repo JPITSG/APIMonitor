@@ -33,7 +33,10 @@ export default function ConfigView({
   updateCompletedVersion,
 }: ConfigViewProps) {
   const [url, setUrl] = useState(config.url);
-  const [interval, setInterval] = useState(config.interval);
+  const [healthyInterval, setHealthyInterval] = useState(
+    config.healthyInterval ?? 60
+  );
+  const [downInterval, setDownInterval] = useState(config.downInterval ?? 10);
   const [loggingEnabled, setLoggingEnabled] = useState(config.loggingEnabled);
   const [historyLimit, setHistoryLimit] = useState(String(config.historyLimit));
   const [autoCheckForUpdates, setAutoCheckForUpdates] = useState(
@@ -182,7 +185,8 @@ export default function ConfigView({
 
     saveSettings({
       url: trimmedUrl,
-      interval,
+      healthyInterval,
+      downInterval,
       loggingEnabled,
       historyLimit: hl,
       autoCheckForUpdates,
@@ -223,13 +227,29 @@ export default function ConfigView({
       </div>
 
       <div data-row className="flex items-center justify-between">
-        <Label htmlFor="interval">Check Interval</Label>
+        <Label htmlFor="healthy-interval">Check When Everything Is OK</Label>
         <select
-          id="interval"
-          value={interval}
-          onChange={(e) => setInterval(Number(e.target.value))}
+          id="healthy-interval"
+          value={healthyInterval}
+          onChange={(e) => setHealthyInterval(Number(e.target.value))}
           className="w-40 h-8 rounded-md border border-neutral-300 bg-transparent px-3 py-1 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400"
         >
+          <option value={60}>Every 1 minute</option>
+          <option value={120}>Every 2 minutes</option>
+          <option value={300}>Every 5 minutes</option>
+        </select>
+      </div>
+
+      <div data-row className="flex items-center justify-between">
+        <Label htmlFor="down-interval">Check When Something Is Down</Label>
+        <select
+          id="down-interval"
+          value={downInterval}
+          onChange={(e) => setDownInterval(Number(e.target.value))}
+          className="w-40 h-8 rounded-md border border-neutral-300 bg-transparent px-3 py-1 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400"
+        >
+          <option value={10}>Every 10 seconds</option>
+          <option value={30}>Every 30 seconds</option>
           <option value={60}>Every 1 minute</option>
           <option value={120}>Every 2 minutes</option>
           <option value={300}>Every 5 minutes</option>
