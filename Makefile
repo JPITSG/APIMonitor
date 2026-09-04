@@ -37,7 +37,7 @@ main.o: $(SOURCES) resource.h version.h
 	@echo "Compiling $(SOURCES)..."
 	$(CC) -c $< -o $@ $(CFLAGS)
 
-resources.o: $(RESOURCES) resource.h version.h assets/empty.ico assets/success.ico assets/fail.ico assets/blank.ico assets/dist/index.html assets/WebView2Loader.dll
+resources.o: $(RESOURCES) resource.h version.h APIMonitor.manifest assets/empty.ico assets/success.ico assets/fail.ico assets/blank.ico assets/dist/index.html assets/WebView2Loader.dll
 	@echo "Compiling resources..."
 	$(WINDRES) $< -o $@
 

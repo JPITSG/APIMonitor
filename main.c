@@ -26,6 +26,11 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "advapi32.lib")
 
+// Not present in older MinGW headers.
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
+
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_REFRESH 1002
@@ -1906,6 +1911,31 @@ void ShowHistoryDialog(HWND hwndParent) {
 // ============================================================================
 // WebView2 helper functions
 // ============================================================================
+
+// The process is per-monitor DPI aware (see APIMonitor.manifest), so window
+// pixels are physical pixels. Convert CSS-pixel measurements using the actual
+// window DPI. Resolve GetDpiForWindow dynamically to retain older-Windows
+// compatibility, with the GDI metric as a fallback.
+typedef UINT (WINAPI *PFN_GetDpiForWindow)(HWND);
+static UINT GetWindowDpi(HWND hwnd) {
+    static PFN_GetDpiForWindow fnGetDpiForWindow = NULL;
+    static BOOL resolved = FALSE;
+    if (!resolved) {
+        fnGetDpiForWindow = (PFN_GetDpiForWindow)GetProcAddress(
+            GetModuleHandleW(L"user32.dll"), "GetDpiForWindow");
+        resolved = TRUE;
+    }
+    if (fnGetDpiForWindow && hwnd) {
+        UINT dpi = fnGetDpiForWindow(hwnd);
+        if (dpi) return dpi;
+    }
+
+    HDC hdc = GetDC(hwnd);
+    if (!hdc) return 96;
+    UINT dpi = (UINT)GetDeviceCaps(hdc, LOGPIXELSX);
+    ReleaseDC(hwnd, hdc);
+    return dpi ? dpi : 96;
+}
 
 static BOOL load_webview2_loader(void) {
     HRSRC hRes = FindResource(NULL, MAKEINTRESOURCE(IDR_WEBVIEW2_DLL), RT_RCDATA);
@@ -3836,21 +3866,50 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
     } else if (strcmp(action, "resize") == 0) {
         int contentHeight = 0;
         json_get_int(msg, "height", &contentHeight);
-        if (contentHeight > 0 && g_webviewHwnd) {
+        // Content height is reported in CSS pixels. A Per-Monitor V2 aware
+        // window uses physical pixels, so scale it at the window's DPI.
+        // Content-driven sizing must not fight a maximized or minimized window.
+        if (contentHeight > 0 && g_webviewHwnd &&
+            !IsZoomed(g_webviewHwnd) && !IsIconic(g_webviewHwnd)) {
+            int physicalHeight = MulDiv(
+                contentHeight, (int)GetWindowDpi(g_webviewHwnd), 96);
             RECT clientRect = {0}, windowRect = {0};
             GetClientRect(g_webviewHwnd, &clientRect);
             GetWindowRect(g_webviewHwnd, &windowRect);
             int chromeH = (windowRect.bottom - windowRect.top) - (clientRect.bottom - clientRect.top);
-            int newWindowH = contentHeight + chromeH;
+            int newWindowH = physicalHeight + chromeH;
             int windowW = windowRect.right - windowRect.left;
-            UINT flags = SWP_NOMOVE | SWP_NOZORDER;
+
+            // Keep the dialog centered and inside its monitor's work area.
+            MONITORINFO mi = {0};
+            mi.cbSize = sizeof(mi);
+            RECT workArea = {
+                0, 0, GetSystemMetrics(SM_CXSCREEN),
+                GetSystemMetrics(SM_CYSCREEN)
+            };
+            HMONITOR monitor = MonitorFromWindow(
+                g_webviewHwnd, MONITOR_DEFAULTTONEAREST);
+            if (!monitor || !GetMonitorInfoW(monitor, &mi)) {
+                SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+            } else {
+                workArea = mi.rcWork;
+            }
+            int workW = workArea.right - workArea.left;
+            int workH = workArea.bottom - workArea.top;
+            if (windowW > workW) windowW = workW;
+            if (newWindowH > workH) newWindowH = workH;
+            int posX = workArea.left + (workW - windowW) / 2;
+            int posY = workArea.top + (workH - newWindowH) / 2;
+
+            UINT flags = SWP_NOZORDER;
             if (g_webviewWindowShown) {
                 flags |= SWP_NOACTIVATE;
             } else {
                 flags |= SWP_SHOWWINDOW;
                 KillTimer(g_webviewHwnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK);
             }
-            SetWindowPos(g_webviewHwnd, NULL, 0, 0, windowW, newWindowH, flags);
+            SetWindowPos(g_webviewHwnd, NULL, posX, posY,
+                         windowW, newWindowH, flags);
             g_webviewWindowShown = TRUE;
             webview_sync_controller_bounds();
         }
@@ -3887,6 +3946,15 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case WM_SIZE:
             webview_sync_controller_bounds();
             return 0;
+
+        case WM_DPICHANGED: {
+            const RECT* suggested = (const RECT*)lParam;
+            SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
 
         case WM_VALIDATE_RESULT:
             if ((LONG)wParam == g_validateGeneration) {
@@ -3985,14 +4053,25 @@ static void ShowWebViewDialog(const char* view, int width, int height) {
     const wchar_t *title = L"Configuration";
     if (strcmp(view, "history") == 0) title = L"Status Change History";
 
-    // Center on screen
-    int screenW = GetSystemMetrics(SM_CXSCREEN);
-    int screenH = GetSystemMetrics(SM_CYSCREEN);
-    int posX = (screenW - width) / 2;
-    int posY = (screenH - height) / 2;
+    // Scale the CSS-sized initial dimensions to physical pixels and center the
+    // hidden window in the primary monitor's usable work area.
+    RECT workArea = {
+        0, 0, GetSystemMetrics(SM_CXSCREEN),
+        GetSystemMetrics(SM_CYSCREEN)
+    };
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    int dpi = (int)GetWindowDpi(NULL);
+    width = MulDiv(width, dpi, 96);
+    height = MulDiv(height, dpi, 96);
+    int workW = workArea.right - workArea.left;
+    int workH = workArea.bottom - workArea.top;
+    if (width > workW) width = workW;
+    if (height > workH) height = workH;
+    int posX = workArea.left + (workW - width) / 2;
+    int posY = workArea.top + (workH - height) / 2;
 
     g_webviewHwnd = CreateWindowExW(0, L"APIMonitorWebViewWnd", title,
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        WS_OVERLAPPEDWINDOW,
         posX, posY, width, height,
         NULL, NULL, g_hInstance, NULL);
 

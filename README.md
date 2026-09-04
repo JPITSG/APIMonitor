@@ -7,6 +7,7 @@ A Windows system tray application that monitors an API endpoint and displays its
 - System tray icon that reflects API status (success, fail, error)
 - Configurable API URL with live validation, healthy/down check intervals, logging toggle, and history limit
 - Modern WebView2-based configuration and history dialogs (React + Tailwind CSS)
+- Crisp Per-Monitor V2 rendering on displays with Windows scaling enabled
 - Status change history with timestamps, copy-to-clipboard, and clear
 - Configuration stored in the Windows registry (`HKCU\SOFTWARE\JPIT\APIMonitor`)
 - First-launch configuration dialog
@@ -124,6 +125,7 @@ the restarted application confirms a successful handoff.
 ├── main.c              # Application source (tray icon, API polling, WebView2 integration)
 ├── resource.h          # Resource IDs
 ├── resources.rc        # Resource definitions (icons, HTML, DLL)
+├── APIMonitor.manifest # Windows compatibility and Per-Monitor V2 DPI awareness
 ├── version.h           # Application and Windows resource version
 ├── Makefile            # Cross-compilation build system
 ├── assets/
