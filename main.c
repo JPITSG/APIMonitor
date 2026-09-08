@@ -53,7 +53,6 @@
 
 #define WM_VALIDATE_RESULT      (WM_APP + 1)
 #define WM_APP_UPDATE_RESULT    (WM_APP + 2)
-#define WM_APP_UPDATE_PROGRESS  (WM_APP + 3)
 #define WM_APP_REFRESH_COMPLETE (WM_APP + 4)
 #define WM_SHOW_FIRST_CONFIG    (WM_USER + 2)
 #define ID_TIMER_REFRESH 1
@@ -61,6 +60,7 @@
 #define ID_TIMER_WEBVIEW_SHOW_FALLBACK 1006
 #define WEBVIEW_SHOW_FALLBACK_DELAY_MS 350
 #define ID_TIMER_AUTO_UPDATE 1007
+#define ID_TIMER_UPDATE_PROGRESS 1008
 #define AUTO_UPDATE_INTERVAL_MS (60u * 60u * 1000u)
 
 #define APP_NAME L"APIMonitor"
@@ -403,8 +403,12 @@ static volatile LONG g_updateCheckAutomatic = FALSE;
 static BOOL g_updateInstallReady = FALSE;
 static volatile LONG g_updateRequestSequence = 0;
 static HANDLE g_updateCancelEvent = NULL;
-static volatile LONG g_updateSpeedKbps = 0;
-static volatile LONG g_updateProgressPosted = FALSE;
+// The worker publishes received bytes; the UI timer samples monotonic time,
+// including periods when WinHttpReadData is blocked and throughput is zero.
+static volatile LONG64 g_updateReceivedBytes = 0;
+static volatile LONG64 g_updateTransferStarted = 0;
+static ULONGLONG g_updateSampleTime = 0;
+static ULONGLONG g_updateSampleBytes = 0;
 static UpdateCheckTask* volatile g_updatePostedResult = NULL;
 static UpdateCheckTask* g_updateNoticeTask = NULL;
 static UpdateCheckTask* g_updateReadyTask = NULL;
@@ -456,12 +460,13 @@ void LoadHistoryFromRegistry(void);
 static void ShowWebViewDialog(const char* view, int width, int height);
 static void StartUpdateCheck(BOOL automatic);
 static void CancelUpdateCheck(void);
-static void InstallPreparedUpdate(void);
+static void InstallPreparedUpdate(BOOL reopenSettings);
 static void DiscardPreparedUpdate(void);
 static void DiscardPendingUpdateNotice(void);
 static void DiscardUpdateTask(UpdateCheckTask* task);
 static void HandleCompletedUpdateCheck(UpdateCheckTask* task);
-static int HandleUpdateCommandLine(BOOL* handled, BOOL* updateCompleted);
+static int HandleUpdateCommandLine(BOOL* handled, BOOL* updateCompleted,
+                                   BOOL* reopenSettings);
 static void webview_execute_script(const wchar_t* script);
 
 // Logging function: writes to ProgramData\APIMonitor.log with timestamp and thread ID
@@ -518,8 +523,9 @@ void CheckLogFileSize() {
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     BOOL updateHelperHandled = FALSE;
     BOOL updateCompleted = FALSE;
+    BOOL reopenSettings = FALSE;
     int updateHelperResult = HandleUpdateCommandLine(
-        &updateHelperHandled, &updateCompleted);
+        &updateHelperHandled, &updateCompleted, &reopenSettings);
     if (updateHelperHandled) return updateHelperResult;
 
     UNREFERENCED_PARAMETER(hPrevInstance);
@@ -664,7 +670,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         PostMessage(hwnd, WM_SHOW_FIRST_CONFIG, 0, 0);
     }
 
-    if (updateCompleted) {
+    if (updateCompleted && reopenSettings) {
         g_updateConfirmationPending = TRUE;
         PostMessage(hwnd, WM_SHOW_FIRST_CONFIG, 0, 0);
     }
@@ -683,21 +689,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
-        case WM_APP_UPDATE_PROGRESS:
-            InterlockedExchange(&g_updateProgressPosted, FALSE);
-            if (InterlockedCompareExchange(&g_updateCheckPending,
-                                           FALSE, FALSE) == TRUE &&
-                g_configViewReady) {
-                DWORD speedKbps = (DWORD)InterlockedCompareExchange(
-                    &g_updateSpeedKbps, 0, 0);
-                wchar_t script[160];
-                swprintf(script, sizeof(script) / sizeof(wchar_t),
-                    L"window.onUpdateProgress({\"kilobytesPerSecond\":%lu})",
-                    (unsigned long)speedKbps);
-                webview_execute_script(script);
-            }
-            return 0;
-
         case WM_APP_UPDATE_RESULT: {
             UpdateCheckTask* task = (UpdateCheckTask*)InterlockedExchangePointer(
                 (PVOID volatile*)&g_updatePostedResult, NULL);
@@ -778,6 +769,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
         case WM_DESTROY:
             KillTimer(hwnd, ID_TIMER_AUTO_UPDATE);
+            KillTimer(hwnd, ID_TIMER_UPDATE_PROGRESS);
             LogMessage("Window destroyed.");
             PostQuitMessage(0);
             break;
@@ -2168,19 +2160,6 @@ static BOOL CancelUpdateTaskIfRequested(UpdateCheckTask* task) {
     return TRUE;
 }
 
-static void PublishUpdateProgress(UpdateCheckTask* task, DWORD speedKbps) {
-    if (!task || CancelUpdateTaskIfRequested(task) ||
-        !IsWindow(task->targetWindow)) {
-        return;
-    }
-
-    InterlockedExchange(&g_updateSpeedKbps, (LONG)speedKbps);
-    if (InterlockedCompareExchange(&g_updateProgressPosted, TRUE, FALSE) == FALSE &&
-        !PostMessageW(task->targetWindow, WM_APP_UPDATE_PROGRESS, 0, 0)) {
-        InterlockedExchange(&g_updateProgressPosted, FALSE);
-    }
-}
-
 static BOOL OpenUpdateHttpRequest(LPCWSTR verb, ULONGLONG cacheBuster,
                                   UpdateHttpRequest* http, DWORD* statusCode) {
     if (!verb || !http) return FALSE;
@@ -2499,8 +2478,7 @@ static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
 
     BOOL ok = TRUE;
     ULONGLONG totalWritten = 0;
-    ULONGLONG speedWindowBytes = 0;
-    ULONGLONG speedWindowStarted = GetTickCount64();
+    InterlockedExchange64(&g_updateTransferStarted, (LONG64)GetTickCount64());
     BYTE buffer[64 * 1024];
     while (ok) {
         if (CancelUpdateTaskIfRequested(task)) {
@@ -2528,6 +2506,7 @@ static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
             break;
         }
 
+        InterlockedAdd64(&g_updateReceivedBytes, bytesRead);
         DWORD bytesWritten = 0;
         if (!WriteFile(file, buffer, bytesRead, &bytesWritten, NULL)) {
             SetUpdateTaskError(task, L"Could not write the staged update", GetLastError());
@@ -2541,20 +2520,8 @@ static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
             break;
         }
         totalWritten += bytesWritten;
-        speedWindowBytes += bytesWritten;
-
-        ULONGLONG now = GetTickCount64();
-        ULONGLONG elapsed = now - speedWindowStarted;
-        if (elapsed >= UPDATE_PROGRESS_INTERVAL_MS) {
-            ULONGLONG speed = (speedWindowBytes * 1000ULL) /
-                              (elapsed * 1024ULL);
-            if (speed == 0 && speedWindowBytes > 0) speed = 1;
-            if (speed > MAXLONG) speed = MAXLONG;
-            PublishUpdateProgress(task, (DWORD)speed);
-            speedWindowBytes = 0;
-            speedWindowStarted = now;
-        }
     }
+    InterlockedExchange64(&g_updateTransferStarted, 0);
 
     if (ok && CancelUpdateTaskIfRequested(task)) ok = FALSE;
     if (ok && totalWritten != expectedSize) {
@@ -2743,16 +2710,17 @@ static HANDLE DuplicateUpdateLaunchToken(HANDLE process) {
 static BOOL LaunchUpdateTarget(LPCWSTR targetPath, LPCWSTR stagedPath,
                                LPCWSTR helperPath, DWORD helperProcessId,
                                DWORD oldProcessId, HANDLE launchToken,
-                               BOOL successfulUpdate) {
+                               BOOL successfulUpdate, BOOL reopenSettings) {
     wchar_t commandLine[MAX_PATH * 3 + 256];
     LPCWSTR finishAction = successfulUpdate
         ? L"--finish-update"
         : L"--finish-update-cleanup";
     int commandLength = swprintf_s(commandLine,
         sizeof(commandLine) / sizeof(wchar_t),
-        L"\"%s\" %s %lu %lu \"%s\" \"%s\"", targetPath, finishAction,
+        L"\"%s\" %s %lu %lu \"%s\" \"%s\"%s", targetPath, finishAction,
         (unsigned long)helperProcessId, (unsigned long)oldProcessId,
-        stagedPath, helperPath);
+        stagedPath, helperPath,
+        successfulUpdate && reopenSettings ? L" --reopen-settings" : L"");
     if (commandLength <= 0 ||
         commandLength >= (int)(sizeof(commandLine) / sizeof(wchar_t))) {
         SetLastError(ERROR_INSUFFICIENT_BUFFER);
@@ -2795,7 +2763,7 @@ static int RestartAfterUpdateFailure(LPCWSTR targetPath, LPCWSTR stagedPath,
                                      HANDLE launchToken, LPCWSTR message) {
     MessageBoxW(NULL, message, APP_NAME L" Update", MB_OK | MB_ICONERROR);
     LaunchUpdateTarget(targetPath, stagedPath, helperPath,
-                       GetCurrentProcessId(), oldProcessId, launchToken, FALSE);
+                       GetCurrentProcessId(), oldProcessId, launchToken, FALSE, FALSE);
     if (launchToken) CloseHandle(launchToken);
     DeleteUpdateTempFile(stagedPath);
     SetFileAttributesW(helperPath, FILE_ATTRIBUTE_NORMAL);
@@ -2804,7 +2772,8 @@ static int RestartAfterUpdateFailure(LPCWSTR targetPath, LPCWSTR stagedPath,
 }
 
 static int RunUpdateApplyHelper(DWORD oldProcessId, LPCWSTR readyEventName,
-                                LPCWSTR targetPath, LPCWSTR stagedPath) {
+                                LPCWSTR targetPath, LPCWSTR stagedPath,
+                                BOOL reopenSettings) {
     wchar_t expectedEventPrefix[96];
     int prefixLength = swprintf_s(expectedEventPrefix,
         sizeof(expectedEventPrefix) / sizeof(wchar_t),
@@ -2934,7 +2903,8 @@ static int RunUpdateApplyHelper(DWORD oldProcessId, LPCWSTR readyEventName,
     }
 
     if (!LaunchUpdateTarget(targetPath, stagedPath, helperPath,
-                            helperProcessId, oldProcessId, launchToken, TRUE)) {
+                            helperProcessId, oldProcessId, launchToken, TRUE,
+                            reopenSettings)) {
         DeleteFileW(targetPath);
         if (!MoveFileExW(backupPath, targetPath,
                          MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
@@ -3005,24 +2975,30 @@ static BOOL FinishUpdateCleanup(DWORD helperProcessId, DWORD oldProcessId,
 // Returns an exit code and sets handled for the temporary updater process.
 // Both finish modes perform cleanup and continue normal application startup;
 // updateCompleted identifies only a successful executable replacement.
-static int HandleUpdateCommandLine(BOOL* handled, BOOL* updateCompleted) {
+static int HandleUpdateCommandLine(BOOL* handled, BOOL* updateCompleted,
+                                   BOOL* reopenSettings) {
     if (handled) *handled = FALSE;
     if (updateCompleted) *updateCompleted = FALSE;
+    if (reopenSettings) *reopenSettings = FALSE;
     int argumentCount = 0;
     LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
     if (!arguments) return 0;
 
     int result = 0;
-    if (argumentCount == 6 && wcscmp(arguments[1], L"--apply-update") == 0) {
+    // Optional and local to this handoff; never persisted in settings.
+    BOOL requestedReopen = argumentCount == 7 &&
+        wcscmp(arguments[6], L"--reopen-settings") == 0;
+    BOOL validArguments = argumentCount == 6 || requestedReopen;
+    if (validArguments && wcscmp(arguments[1], L"--apply-update") == 0) {
         DWORD oldProcessId = 0;
         if (handled) *handled = TRUE;
         if (!ParseUpdateProcessId(arguments[2], &oldProcessId)) {
             result = ERROR_INVALID_PARAMETER;
         } else {
             result = RunUpdateApplyHelper(oldProcessId, arguments[3],
-                                          arguments[4], arguments[5]);
+                                          arguments[4], arguments[5], requestedReopen);
         }
-    } else if (argumentCount == 6 &&
+    } else if (validArguments &&
                (wcscmp(arguments[1], L"--finish-update") == 0 ||
                 wcscmp(arguments[1], L"--finish-update-cleanup") == 0)) {
         DWORD helperProcessId = 0, oldProcessId = 0;
@@ -3033,6 +3009,7 @@ static int HandleUpdateCommandLine(BOOL* handled, BOOL* updateCompleted) {
             if (recognizedHandoff && updateCompleted &&
                 wcscmp(arguments[1], L"--finish-update") == 0) {
                 *updateCompleted = TRUE;
+                if (reopenSettings) *reopenSettings = requestedReopen;
             }
         }
     }
@@ -3081,6 +3058,35 @@ static void CfgSendUpdateProgress(DWORD speedKbps) {
         L"window.onUpdateProgress({\"kilobytesPerSecond\":%lu})",
         (unsigned long)speedKbps);
     if (written > 0) webview_execute_script(script);
+}
+
+static void CALLBACK UpdateProgressTimer(HWND hwnd, UINT message,
+                                         UINT_PTR timerId, DWORD time) {
+    UNREFERENCED_PARAMETER(message);
+    UNREFERENCED_PARAMETER(time);
+    if (!InterlockedCompareExchange(&g_updateCheckPending, FALSE, FALSE)) {
+        KillTimer(hwnd, timerId);
+        return;
+    }
+    if (g_updateCancelEvent &&
+        WaitForSingleObject(g_updateCancelEvent, 0) == WAIT_OBJECT_0) return;
+
+    ULONGLONG started = (ULONGLONG)InterlockedCompareExchange64(
+        &g_updateTransferStarted, 0, 0);
+    if (!started) return; // HEAD/checking or validation, no active transfer.
+    ULONGLONG received = (ULONGLONG)InterlockedCompareExchange64(
+        &g_updateReceivedBytes, 0, 0);
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG elapsed = now - (g_updateSampleTime ? g_updateSampleTime : started);
+    if (elapsed < UPDATE_PROGRESS_INTERVAL_MS) return;
+
+    ULONGLONG divisor = elapsed * 1024ULL;
+    ULONGLONG speed = ((received - g_updateSampleBytes) * 1000ULL + divisor / 2) /
+                      divisor; // Nearest whole KB/s, including zero on stalls.
+    if (speed > MAXLONG) speed = MAXLONG;
+    g_updateSampleTime = now;
+    g_updateSampleBytes = received;
+    if (g_configViewReady) CfgSendUpdateProgress((DWORD)speed);
 }
 
 static void DiscardPendingUpdateNotice(void) {
@@ -3132,8 +3138,10 @@ static void StartUpdateCheck(BOOL automatic) {
         }
     }
     ResetEvent(g_updateCancelEvent);
-    InterlockedExchange(&g_updateSpeedKbps, 0);
-    InterlockedExchange(&g_updateProgressPosted, FALSE);
+    InterlockedExchange64(&g_updateReceivedBytes, 0);
+    InterlockedExchange64(&g_updateTransferStarted, 0);
+    g_updateSampleTime = 0;
+    g_updateSampleBytes = 0;
 
     UpdateCheckTask* task = (UpdateCheckTask*)calloc(1, sizeof(UpdateCheckTask));
     if (!task) {
@@ -3151,9 +3159,14 @@ static void StartUpdateCheck(BOOL automatic) {
         ((GetTickCount64() ^ GetCurrentProcessId()) << 32) | (DWORD)sequence;
     if (task->cacheBuster == 0) task->cacheBuster = 1;
 
-    HANDLE thread = CreateThread(NULL, 0, UpdateCheckThread, task, 0, NULL);
+    HANDLE thread = NULL;
+    if (SetTimer(targetWindow, ID_TIMER_UPDATE_PROGRESS,
+                 UPDATE_PROGRESS_INTERVAL_MS, UpdateProgressTimer)) {
+        thread = CreateThread(NULL, 0, UpdateCheckThread, task, 0, NULL);
+    }
     if (!thread) {
         DWORD errorCode = GetLastError();
+        KillTimer(targetWindow, ID_TIMER_UPDATE_PROGRESS);
         free(task);
         InterlockedExchange(&g_updateCheckPending, FALSE);
         InterlockedExchange(&g_updateCheckAutomatic, FALSE);
@@ -3261,8 +3274,7 @@ static void QueueUpdateNotice(UpdateCheckTask* task) {
 
 static void HandleCompletedUpdateCheck(UpdateCheckTask* task) {
     if (!task) return;
-    InterlockedExchange(&g_updateProgressPosted, FALSE);
-    InterlockedExchange(&g_updateSpeedKbps, 0);
+    KillTimer(task->targetWindow, ID_TIMER_UPDATE_PROGRESS);
 
     if (task->kind == UPDATE_CHECK_CANCELLED) {
         LogUpdateMessage(L"[INFO] Update check cancelled\n");
@@ -3382,7 +3394,8 @@ static HANDLE CreateUpdateReadyEvent(DWORD processId, wchar_t* eventName,
     return readyEvent;
 }
 
-static BOOL LaunchStagedUpdate(LPCWSTR stagedPath, LPCWSTR targetPath) {
+static BOOL LaunchStagedUpdate(LPCWSTR stagedPath, LPCWSTR targetPath,
+                               BOOL reopenSettings) {
     if (!stagedPath || !targetPath || !*stagedPath || !*targetPath) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
@@ -3419,8 +3432,9 @@ static BOOL LaunchStagedUpdate(LPCWSTR stagedPath, LPCWSTR targetPath) {
     wchar_t parameters[MAX_PATH * 2 + 512];
     int parameterLength = swprintf_s(parameters,
         sizeof(parameters) / sizeof(wchar_t),
-        L"--apply-update %lu \"%s\" \"%s\" \"%s\"",
-        (unsigned long)oldProcessId, readyEventName, targetPath, stagedPath);
+        L"--apply-update %lu \"%s\" \"%s\" \"%s\"%s",
+        (unsigned long)oldProcessId, readyEventName, targetPath, stagedPath,
+        reopenSettings ? L" --reopen-settings" : L"");
     if (parameterLength <= 0 ||
         parameterLength >= (int)(sizeof(parameters) / sizeof(wchar_t))) {
         CloseHandle(readyEvent);
@@ -3482,7 +3496,7 @@ static void DiscardPreparedUpdate(void) {
     DiscardUpdateTask(task);
 }
 
-static void InstallPreparedUpdate(void) {
+static void InstallPreparedUpdate(BOOL reopenSettings) {
     UpdateCheckTask* task = g_updateReadyTask;
     g_updateReadyTask = NULL;
     if (!task || (task->kind != UPDATE_CHECK_NEWER &&
@@ -3493,7 +3507,7 @@ static void InstallPreparedUpdate(void) {
         return;
     }
 
-    if (LaunchStagedUpdate(task->stagedPath, task->targetPath)) {
+    if (LaunchStagedUpdate(task->stagedPath, task->targetPath, reopenSettings)) {
         LogUpdateMessage(L"[INFO] Update accepted; exiting for replacement\n");
         g_updateInstallReady = TRUE;
         free(task);  // The updater process now owns the staged file.
@@ -3803,7 +3817,9 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
     } else if (strcmp(action, "cancelUpdateCheck") == 0) {
         CancelUpdateCheck();
     } else if (strcmp(action, "installUpdate") == 0) {
-        InstallPreparedUpdate();
+        BOOL reopenSettings = FALSE;
+        json_get_bool(msg, "reopenSettingsAfterUpdate", &reopenSettings);
+        InstallPreparedUpdate(reopenSettings);
     } else if (strcmp(action, "dismissUpdate") == 0) {
         DiscardPreparedUpdate();
     } else if (strcmp(action, "ignoreUpdateVersion") == 0) {
@@ -3927,17 +3943,6 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
 
 static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-        case WM_APP_UPDATE_PROGRESS:
-            InterlockedExchange(&g_updateProgressPosted, FALSE);
-            if (InterlockedCompareExchange(&g_updateCheckPending,
-                                           FALSE, FALSE) == TRUE &&
-                g_configViewReady) {
-                DWORD speedKbps = (DWORD)InterlockedCompareExchange(
-                    &g_updateSpeedKbps, 0, 0);
-                CfgSendUpdateProgress(speedKbps);
-            }
-            return 0;
-
         case WM_APP_UPDATE_RESULT: {
             UpdateCheckTask* task = (UpdateCheckTask*)InterlockedExchangePointer(
                 (PVOID volatile*)&g_updatePostedResult, NULL);
@@ -4122,6 +4127,7 @@ void ExitApplication(HWND hwnd) {
     LogMessage("=== Application shutting down ===");
 
     KillTimer(hwnd, ID_TIMER_AUTO_UPDATE);
+    KillTimer(hwnd, ID_TIMER_UPDATE_PROGRESS);
     if (g_updateCancelEvent) SetEvent(g_updateCancelEvent);
     DiscardUpdateTask((UpdateCheckTask*)InterlockedExchangePointer(
         (PVOID volatile*)&g_updatePostedResult, NULL));

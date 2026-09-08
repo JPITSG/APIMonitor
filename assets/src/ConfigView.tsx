@@ -51,6 +51,7 @@ export default function ConfigView({
   );
   const [updateCancelling, setUpdateCancelling] = useState(false);
   const [updateSpeedKbps, setUpdateSpeedKbps] = useState<number | null>(null);
+  const [reopenSettingsAfterUpdate, setReopenSettingsAfterUpdate] = useState(false);
   const [updateAlert, setUpdateAlert] = useState<UpdateResult | null>(() =>
     updateCompletedVersion
       ? {
@@ -84,6 +85,7 @@ export default function ConfigView({
       setUpdateChecking(false);
       setUpdateCancelling(false);
       setUpdateSpeedKbps(null);
+      setReopenSettingsAfterUpdate(false);
       if (result.status === "cancelled") {
         setUpdateAlert((current) =>
           result.automatic && current?.status === "completed" ? current : null
@@ -140,7 +142,8 @@ export default function ConfigView({
     setUpdateChecking(true);
     setUpdateCancelling(false);
     setUpdateSpeedKbps(null);
-    installUpdate();
+    installUpdate(reopenSettingsAfterUpdate);
+    setReopenSettingsAfterUpdate(false);
   };
 
   const handleDismissUpdate = () => {
@@ -150,12 +153,14 @@ export default function ConfigView({
       dismissUpdate();
     }
     setUpdateAlert(null);
+    setReopenSettingsAfterUpdate(false);
   };
 
   const handleIgnoreUpdateVersion = () => {
     if (!updateAlert?.remoteVersion) return;
     ignoreUpdateVersion(updateAlert.remoteVersion);
     setUpdateAlert(null);
+    setReopenSettingsAfterUpdate(false);
   };
 
   const handleUrlChange = (newUrl: string) => {
@@ -323,7 +328,7 @@ export default function ConfigView({
               : updateChecking
                 ? updateSpeedKbps === null
                   ? "Checking..."
-                  : `Checking (${updateSpeedKbps.toLocaleString()} KB/s)...`
+                  : `Checking (${updateSpeedKbps}kb/s)...`
                 : "Update"}
           </Button>
           <Button
@@ -371,6 +376,18 @@ export default function ConfigView({
                   {updateAlert.remoteVersion}
                 </dd>
               </dl>
+            )}
+            {(updateAlert.status === "newer" || updateAlert.status === "same") && (
+              <label className="flex items-center gap-2 text-xs text-neutral-600">
+                <input
+                  type="checkbox"
+                  checked={reopenSettingsAfterUpdate}
+                  onChange={(event) => setReopenSettingsAfterUpdate(event.target.checked)}
+                  disabled={updateChecking}
+                  className="h-3.5 w-3.5 rounded border-neutral-300 accent-neutral-900"
+                />
+                Reopen settings after update
+              </label>
             )}
             <div className="flex justify-end gap-2">
               {updateAlert.status === "newer" && updateAlert.automatic && (

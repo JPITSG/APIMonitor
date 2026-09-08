@@ -111,13 +111,23 @@ result and can reinstall the current version.
 
 Checks download [`release/APIMonitor.exe`](release/APIMonitor.exe) to the user's
 temporary directory and compare its embedded Windows file version with the
-running executable. The download is size-limited, reports transfer speed, and
-can be cancelled. An older repository build is never installable.
+running executable. The download is size-limited and can be cancelled. During
+transfer, the red Update button shows live speed as `Checking (100kb/s)...`,
+rounded to the nearest whole kilobyte per second (1 KB = 1024 bytes), sampled
+every 250 ms, including zero during stalls. Before transfer it shows
+`Checking...`. Click it to stop; it is disabled while cancellation finishes.
+An older repository build is never installable.
 
 Installing uses a short-lived elevated helper to replace the executable and
 restart APIMonitor in the user's normal session. If replacement or restart
 fails, the previous executable is restored. Temporary files are removed after
 the restarted application confirms a successful handoff.
+
+The version confirmation includes **Reopen settings after update**, unchecked
+by default. Check it to reopen Configure with the completion message after a
+successful update and restart; otherwise settings stay closed. This choice
+applies only to that confirmation (including a same-version reinstall), is
+never saved as a preference, and is discarded on cancellation or failure.
 
 ## Project Structure
 
