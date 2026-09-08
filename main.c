@@ -723,7 +723,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 POINT pt;
                 GetCursorPos(&pt);
                 SetForegroundWindow(hwnd);
-                EnableMenuItem(hMenu, ID_TRAY_CONFIGURE, g_webviewHwnd ? MF_GRAYED : MF_ENABLED);
+                EnableMenuItem(hMenu, ID_TRAY_CONFIGURE,
+                    MF_BYCOMMAND | ((g_webviewHwnd && strcmp(g_pendingView, "config") != 0)
+                        ? MF_GRAYED : MF_ENABLED));
                 EnableMenuItem(hMenu, ID_TRAY_HISTORY, g_webviewHwnd ? MF_GRAYED : MF_ENABLED);
                 TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
                 LogMessage("Context menu opened at position (%ld, %ld).", pt.x, pt.y);
@@ -4017,6 +4019,7 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 static void ShowWebViewDialog(const char* view, int width, int height) {
     // If already open, bring to front
     if (g_webviewHwnd != NULL) {
+        if (IsIconic(g_webviewHwnd)) ShowWindow(g_webviewHwnd, SW_RESTORE);
         SetForegroundWindow(g_webviewHwnd);
         return;
     }
