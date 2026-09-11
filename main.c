@@ -721,8 +721,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
                 LogMessage("Context menu opened at position (%ld, %ld).", pt.x, pt.y);
             } else if (lParam == WM_LBUTTONDBLCLK) {
-                LogMessage("Tray icon double-clicked. Triggering manual refresh.");
-                RefreshStatus();
+                // Only one WebView dialog exists at a time, so an open
+                // dialog (history or configuration) is brought forward
+                // rather than replaced.
+                if (g_webviewHwnd) {
+                    LogMessage("Tray icon double-clicked. Focusing the open %s dialog.",
+                               g_pendingView);
+                } else {
+                    LogMessage("Tray icon double-clicked. Opening history dialog.");
+                }
+                ShowHistoryDialog(g_hwnd);
             }
             break;
 

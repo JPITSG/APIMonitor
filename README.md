@@ -8,7 +8,7 @@ A Windows system tray application that monitors an API endpoint and displays its
 - Configurable API URL with live validation, healthy/down check intervals, logging toggle, and history limit
 - Modern WebView2-based configuration and history dialogs (React + Tailwind CSS)
 - Crisp Per-Monitor V2 rendering on displays with Windows scaling enabled
-- Status change history with timestamps, copy-to-clipboard, and clear
+- Status change history with timestamps, copy-to-clipboard, and clear, opened by double-clicking the tray icon or from its right-click menu under **History**
 - Configuration stored in the Windows registry (`HKCU\SOFTWARE\JPIT\APIMonitor`)
 - First-launch configuration dialog
 - Automatic retry on network errors (3 attempts, 2s delay)
