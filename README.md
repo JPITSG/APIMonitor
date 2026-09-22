@@ -112,10 +112,11 @@ result and can reinstall the current version.
 Checks download [`release/APIMonitor.exe`](release/APIMonitor.exe) to the user's
 temporary directory and compare its embedded Windows file version with the
 running executable. The download is size-limited and can be cancelled. During
-transfer, the red Update button shows live speed as `Checking (100kb/s)...`,
-rounded to the nearest whole kilobyte per second (1 KB = 1024 bytes), sampled
-every 250 ms, including zero during stalls. Before transfer it shows
-`Checking...`. Click it to stop; it is disabled while cancellation finishes.
+transfer, the red Update button shows how much of the download has completed
+as `Checking (42%)...`, rounded down to a whole percentage (so 100% appears
+only once every byte has arrived) and refreshed every 250 ms. Before transfer
+it shows `Checking...`. Click it again to stop the check and remove the partial
+download; it shows `Stopping...` and is disabled while cancellation finishes.
 An older repository build is never installable.
 
 Installing uses a short-lived elevated helper to replace the executable and

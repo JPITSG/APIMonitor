@@ -46,26 +46,25 @@ const puppeteer = require('puppeteer');
     };
     await click('Update');
     await page.waitForFunction(() => document.body.textContent.includes('Checking...'));
-    await page.evaluate(() => window.onUpdateProgress({kilobytesPerSecond: 100}));
-    await page.waitForFunction(() => document.body.textContent.includes('Checking (100kb/s)...'));
-    await page.waitForFunction(() => {
-      const button = [...document.querySelectorAll('button')].find(b => b.textContent === 'Checking (100kb/s)...');
-      return button && getComputedStyle(button).backgroundColor === 'rgb(220, 38, 38)';
-    });
-    const busy = await page.evaluate(() => {
-      const button = [...document.querySelectorAll('button')].find(b => b.textContent === 'Checking (100kb/s)...');
-      return { disabled: button.disabled, color: getComputedStyle(button).backgroundColor };
-    });
-    assert.equal(busy.disabled, false); // Existing click-to-cancel behavior.
-    assert.equal(busy.color, 'rgb(220, 38, 38)');
-    await page.evaluate(() => window.onUpdateProgress({kilobytesPerSecond: 12345}));
-    await page.waitForFunction(() => document.body.textContent.includes('Checking (12345kb/s)...'));
-    await click('Checking (12345kb/s)...');
+    // Each expected label differs from the previous one, so every step waits for a re-render.
+    for (const [percent, expected] of [[0, 0], [7, 7], [42.9, 42], [150, 100], [-5, 0], [100, 100], [42, 42]]) {
+      await page.evaluate(percent => window.onUpdateProgress({percent}), percent);
+      const label = `Checking (${expected}%)...`;
+      await page.waitForFunction(label => [...document.querySelectorAll('button')].some(b =>
+        b.textContent === label && getComputedStyle(b).backgroundColor === 'rgb(220, 38, 38)'), {}, label);
+      const busy = await page.evaluate(label => {
+        const button = [...document.querySelectorAll('button')].find(b => b.textContent === label);
+        return { disabled: button.disabled, digits: getComputedStyle(button).fontVariantNumeric };
+      }, label);
+      assert.equal(busy.disabled, false); // Clicking again stops the download.
+      assert.equal(busy.digits, 'tabular-nums');
+    }
+    await click('Checking (42%)...');
     await page.waitForFunction(() => [...document.querySelectorAll('button')].some(b => b.textContent === 'Stopping...' && b.disabled));
-    assert(await page.evaluate(() => window.messages.some(m => m.action === 'cancelUpdateCheck')));
+    assert.equal(await page.evaluate(() => window.messages.filter(m => m.action === 'cancelUpdateCheck').length), 1);
     await page.evaluate(() => window.onUpdateResult({status: 'cancelled'}));
     await click('Update');
-    await page.waitForFunction(() => document.body.textContent.includes('Checking...'));
+    await page.waitForFunction(() => document.body.textContent.includes('Checking...')); // Percentage cleared.
     await result('newer');
     await unchecked();
     await page.click(checkbox);
@@ -99,7 +98,7 @@ const puppeteer = require('puppeteer');
     assert.equal(await page.$(checkbox), null);
     assert.equal(await page.$$eval('[role="alertdialog"] button', buttons => buttons.map(b => b.textContent).join()), 'OK');
     assert.deepEqual(errors, []);
-    console.log('Browser update UI, styling, cancellation, choice reset, and bridge tests passed');
+    console.log('Browser update UI, percentage label, styling, cancellation, choice reset, and bridge tests passed');
   } finally {
     await browser.close();
   }

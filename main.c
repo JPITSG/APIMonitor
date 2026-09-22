@@ -403,12 +403,10 @@ static volatile LONG g_updateCheckAutomatic = FALSE;
 static BOOL g_updateInstallReady = FALSE;
 static volatile LONG g_updateRequestSequence = 0;
 static HANDLE g_updateCancelEvent = NULL;
-// The worker publishes received bytes; the UI timer samples monotonic time,
-// including periods when WinHttpReadData is blocked and throughput is zero.
+// The worker publishes received bytes and the expected download size (0 until
+// the body transfer starts); the UI timer reports them as a whole percentage.
 static volatile LONG64 g_updateReceivedBytes = 0;
-static volatile LONG64 g_updateTransferStarted = 0;
-static ULONGLONG g_updateSampleTime = 0;
-static ULONGLONG g_updateSampleBytes = 0;
+static volatile LONG64 g_updateExpectedBytes = 0;
 static UpdateCheckTask* volatile g_updatePostedResult = NULL;
 static UpdateCheckTask* g_updateNoticeTask = NULL;
 static UpdateCheckTask* g_updateReadyTask = NULL;
@@ -2486,7 +2484,9 @@ static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
 
     BOOL ok = TRUE;
     ULONGLONG totalWritten = 0;
-    InterlockedExchange64(&g_updateTransferStarted, (LONG64)GetTickCount64());
+    // Not cleared after the loop, so the timer can still report the final
+    // percentage while the staged file is validated. StartUpdateCheck clears it.
+    InterlockedExchange64(&g_updateExpectedBytes, (LONG64)expectedSize);
     BYTE buffer[64 * 1024];
     while (ok) {
         if (CancelUpdateTaskIfRequested(task)) {
@@ -2529,7 +2529,6 @@ static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
         }
         totalWritten += bytesWritten;
     }
-    InterlockedExchange64(&g_updateTransferStarted, 0);
 
     if (ok && CancelUpdateTaskIfRequested(task)) ok = FALSE;
     if (ok && totalWritten != expectedSize) {
@@ -3060,12 +3059,21 @@ static void CfgSendUpdateResult(LPCWSTR status, LPCWSTR title, LPCWSTR message) 
     CfgSendUpdateResultWithVersions(status, title, message, L"", L"", FALSE);
 }
 
-static void CfgSendUpdateProgress(DWORD speedKbps) {
+static void CfgSendUpdateProgress(DWORD percent) {
     wchar_t script[160];
     int written = swprintf_s(script, sizeof(script) / sizeof(wchar_t),
-        L"window.onUpdateProgress({\"kilobytesPerSecond\":%lu})",
-        (unsigned long)speedKbps);
+        L"window.onUpdateProgress({\"percent\":%lu})",
+        (unsigned long)percent);
     if (written > 0) webview_execute_script(script);
+}
+
+// Round down to whole percent so 100 appears only once every byte has
+// arrived. Download sizes are bounded by UPDATE_MAX_BYTES.
+static DWORD CalculateUpdateProgressPercent(ULONGLONG receivedBytes,
+                                            ULONGLONG totalBytes) {
+    if (!totalBytes) return 0;
+    if (receivedBytes >= totalBytes) return 100;
+    return (DWORD)(receivedBytes * 100ULL / totalBytes);
 }
 
 static void CALLBACK UpdateProgressTimer(HWND hwnd, UINT message,
@@ -3079,22 +3087,15 @@ static void CALLBACK UpdateProgressTimer(HWND hwnd, UINT message,
     if (g_updateCancelEvent &&
         WaitForSingleObject(g_updateCancelEvent, 0) == WAIT_OBJECT_0) return;
 
-    ULONGLONG started = (ULONGLONG)InterlockedCompareExchange64(
-        &g_updateTransferStarted, 0, 0);
-    if (!started) return; // HEAD/checking or validation, no active transfer.
+    ULONGLONG expected = (ULONGLONG)InterlockedCompareExchange64(
+        &g_updateExpectedBytes, 0, 0);
+    if (!expected) return; // HEAD/checking, the download body has not started.
     ULONGLONG received = (ULONGLONG)InterlockedCompareExchange64(
         &g_updateReceivedBytes, 0, 0);
-    ULONGLONG now = GetTickCount64();
-    ULONGLONG elapsed = now - (g_updateSampleTime ? g_updateSampleTime : started);
-    if (elapsed < UPDATE_PROGRESS_INTERVAL_MS) return;
-
-    ULONGLONG divisor = elapsed * 1024ULL;
-    ULONGLONG speed = ((received - g_updateSampleBytes) * 1000ULL + divisor / 2) /
-                      divisor; // Nearest whole KB/s, including zero on stalls.
-    if (speed > MAXLONG) speed = MAXLONG;
-    g_updateSampleTime = now;
-    g_updateSampleBytes = received;
-    if (g_configViewReady) CfgSendUpdateProgress((DWORD)speed);
+    // Resent on every tick, so a dialog opened mid-download catches up.
+    if (g_configViewReady) {
+        CfgSendUpdateProgress(CalculateUpdateProgressPercent(received, expected));
+    }
 }
 
 static void DiscardPendingUpdateNotice(void) {
@@ -3147,9 +3148,7 @@ static void StartUpdateCheck(BOOL automatic) {
     }
     ResetEvent(g_updateCancelEvent);
     InterlockedExchange64(&g_updateReceivedBytes, 0);
-    InterlockedExchange64(&g_updateTransferStarted, 0);
-    g_updateSampleTime = 0;
-    g_updateSampleBytes = 0;
+    InterlockedExchange64(&g_updateExpectedBytes, 0);
 
     UpdateCheckTask* task = (UpdateCheckTask*)calloc(1, sizeof(UpdateCheckTask));
     if (!task) {

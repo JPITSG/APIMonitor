@@ -14,10 +14,8 @@ typedef wchar_t *LPWSTR;
 #define FALSE 0
 #define TRUE 1
 #define CALLBACK
-#define MAXLONG INT32_MAX
 #define ERROR_INVALID_PARAMETER 87
 #define WAIT_OBJECT_0 0
-#define UPDATE_PROGRESS_INTERVAL_MS 250
 #define UNREFERENCED_PARAMETER(x) (void)(x)
 static int argcMock, cleanupValid, applyCalls, applyReopen, cleanupCalls;
 static LPWSTR *argvMock;
@@ -39,9 +37,8 @@ static BOOL FinishUpdateCleanup(DWORD helper, DWORD old, LPCWSTR staged,
     return cleanupValid;
 }
 static int g_updateCheckPending, g_updateCancelEvent, g_configViewReady;
-static volatile LONG64 g_updateTransferStarted, g_updateReceivedBytes;
-static ULONGLONG g_updateSampleTime, g_updateSampleBytes, nowMock;
-static DWORD lastSpeed;
+static volatile LONG64 g_updateExpectedBytes, g_updateReceivedBytes;
+static DWORD lastPercent;
 static int sent, killed;
 static int InterlockedCompareExchange(int *value, int swap, int compare) {
     return *value;
@@ -52,8 +49,7 @@ static LONG64 InterlockedCompareExchange64(volatile LONG64 *value,
 }
 static DWORD WaitForSingleObject(int event, DWORD timeout) { return 0; }
 static void KillTimer(HWND hwnd, UINT_PTR id) { killed++; }
-static ULONGLONG GetTickCount64(void) { return nowMock; }
-static void CfgSendUpdateProgress(DWORD speed) { lastSpeed = speed; sent++; }
+static void CfgSendUpdateProgress(DWORD percent) { lastPercent = percent; sent++; }
 
 /* PRODUCTION FUNCTIONS */
 
@@ -93,40 +89,45 @@ int main(void) {
     HandleUpdateCommandLine(&handled, &complete, &reopen);
     assert(!handled && !complete && !reopen);
 
+    assert(CalculateUpdateProgressPercent(0, 1000) == 0);
+    assert(CalculateUpdateProgressPercent(9, 1000) == 0);
+    assert(CalculateUpdateProgressPercent(10, 1000) == 1);
+    assert(CalculateUpdateProgressPercent(1, 3) == 33);
+    assert(CalculateUpdateProgressPercent(2, 3) == 66); // Rounds down.
+    assert(CalculateUpdateProgressPercent(999, 1000) == 99); // Never an early 100.
+    assert(CalculateUpdateProgressPercent(1000, 1000) == 100);
+    assert(CalculateUpdateProgressPercent(2000, 1000) == 100);
+    assert(CalculateUpdateProgressPercent(5, 0) == 0);
+    assert(CalculateUpdateProgressPercent(100ULL * 1024 * 1024 - 1,
+                                          100ULL * 1024 * 1024) == 99);
+    assert(CalculateUpdateProgressPercent(100ULL * 1024 * 1024,
+                                          100ULL * 1024 * 1024) == 100);
+
     g_updateCheckPending = g_configViewReady = TRUE;
-    nowMock = 1000;
     UpdateProgressTimer(0, 0, 0, 0);
     assert(!sent); // HEAD phase.
-    g_updateTransferStarted = 1000;
-    g_updateReceivedBytes = 25600;
-    nowMock = 1249;
+    g_updateExpectedBytes = 1000;
     UpdateProgressTimer(0, 0, 0, 0);
-    assert(!sent); // Throttle.
-    nowMock = 1250;
+    assert(sent == 1 && lastPercent == 0); // Body transfer started.
+    g_updateReceivedBytes = 429;
     UpdateProgressTimer(0, 0, 0, 0);
-    assert(sent == 1 && lastSpeed == 100);
-    nowMock = 1500; g_updateReceivedBytes += 128;
+    assert(sent == 2 && lastPercent == 42);
     UpdateProgressTimer(0, 0, 0, 0);
-    assert(lastSpeed == 1); // 0.5 rounds up.
-    nowMock = 1750; g_updateReceivedBytes += 127;
+    assert(sent == 3 && lastPercent == 42); // Stall resends for a late dialog.
+    g_configViewReady = FALSE;
     UpdateProgressTimer(0, 0, 0, 0);
-    assert(lastSpeed == 0); // Below 0.5 rounds down.
-    nowMock = 2000;
+    assert(sent == 3); // No settings dialog.
+    g_configViewReady = TRUE;
+    g_updateReceivedBytes = 1000;
     UpdateProgressTimer(0, 0, 0, 0);
-    assert(lastSpeed == 0); // Blocked read/stall.
-    nowMock = 3000; g_updateReceivedBytes += 102400;
+    assert(sent == 4 && lastPercent == 100); // Kept while validating.
+    g_updateCancelEvent = TRUE;
     UpdateProgressTimer(0, 0, 0, 0);
-    assert(lastSpeed == 100); // Delayed timer uses actual elapsed time.
-    int before = sent;
-    g_updateCancelEvent = TRUE; nowMock += 250;
-    UpdateProgressTimer(0, 0, 0, 0);
-    assert(sent == before);
-    g_updateCancelEvent = FALSE; g_updateTransferStarted = 0;
-    UpdateProgressTimer(0, 0, 0, 0);
-    assert(sent == before); // Validation/finished transfer.
+    assert(sent == 4); // Stopping.
+    g_updateCancelEvent = FALSE;
     g_updateCheckPending = FALSE;
     UpdateProgressTimer(0, 0, 0, 0);
-    assert(killed == 1 && sent == before);
-    puts("Native speed and updater handoff tests passed");
+    assert(killed == 1 && sent == 4);
+    puts("Native progress and updater handoff tests passed");
     return 0;
 }

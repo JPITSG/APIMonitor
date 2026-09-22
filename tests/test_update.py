@@ -18,7 +18,8 @@ def function(name):
 harness = (root / 'tests/update_harness.c').read_text()
 harness = harness.replace('/* PRODUCTION FUNCTIONS */', '\n\n'.join(
     function(name) for name in (
-        'ParseUpdateProcessId', 'HandleUpdateCommandLine', 'UpdateProgressTimer')))
+        'ParseUpdateProcessId', 'HandleUpdateCommandLine',
+        'CalculateUpdateProgressPercent', 'UpdateProgressTimer')))
 with tempfile.TemporaryDirectory(prefix='apimonitor-tests-') as directory:
     path = Path(directory)
     (path / 'test.c').write_text(harness)
@@ -35,5 +36,10 @@ assert 'successfulUpdate && reopenSettings ? L" --reopen-settings" : L""' in fun
 assert 'launchToken, TRUE,\n                            reopenSettings)' in function('RunUpdateApplyHelper')
 assert 'launchToken, FALSE, FALSE)' in function('RestartAfterUpdateFailure')
 assert 'if (updateCompleted && reopenSettings)' in source
-assert 'InterlockedAdd64(&g_updateReceivedBytes, bytesRead)' in function('DownloadUpdateFile')
+download = function('DownloadUpdateFile')
+assert 'InterlockedAdd64(&g_updateReceivedBytes, bytesRead)' in download
+# Set before the read loop and not cleared until the next check starts.
+assert 'InterlockedExchange64(&g_updateExpectedBytes, (LONG64)expectedSize);' in download
+assert download.count('g_updateExpectedBytes') == 1
+assert 'InterlockedExchange64(&g_updateExpectedBytes, 0);' in function('StartUpdateCheck')
 print('Updater launch/startup wiring checks passed')
