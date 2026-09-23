@@ -50,6 +50,9 @@
 #define REG_VALUE_AUTO_UPDATE "AutoCheckForUpdates"
 #define REG_VALUE_IGNORED_UPDATE_VERSION_W L"IgnoredUpdateVersion"
 #define REG_KEY_PATH_W L"SOFTWARE\\JPIT\\APIMonitor"
+#define STARTUP_RUN_KEY_W L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define STARTUP_APPROVED_RUN_KEY_W \
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run"
 
 #define WM_VALIDATE_RESULT      (WM_APP + 1)
 #define WM_APP_UPDATE_RESULT    (WM_APP + 2)
@@ -964,6 +967,67 @@ void MarkAsConfigured() {
     RegSetValueExA(hKey, REG_VALUE_CONFIGURED, 0, REG_DWORD,
                    (const BYTE*)&dwConfigured, sizeof(dwConfigured));
     RegCloseKey(hKey);
+}
+
+// --- Start with Windows ---
+// A per-user Run entry launches this executable at sign-in. Task Manager and
+// Settings can disable that entry without deleting it (odd first byte of its
+// StartupApproved value), so a disabled entry counts as off.
+
+static BOOL GetStartupCommand(wchar_t* command, size_t commandCch) {
+    wchar_t path[MAX_PATH];
+    DWORD length = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return FALSE;
+    return swprintf_s(command, commandCch, L"\"%s\"", path) > 0;
+}
+
+static BOOL IsStartWithWindowsEnabled(void) {
+    wchar_t expected[MAX_PATH + 2];
+    wchar_t actual[MAX_PATH + 2];
+    DWORD size = sizeof(actual);
+    if (!GetStartupCommand(expected, sizeof(expected) / sizeof(wchar_t)) ||
+        RegGetValueW(HKEY_CURRENT_USER, STARTUP_RUN_KEY_W, APP_NAME,
+                     RRF_RT_REG_SZ, NULL, actual, &size) != ERROR_SUCCESS ||
+        _wcsicmp(actual, expected) != 0) {
+        return FALSE;
+    }
+
+    BYTE approved[64];
+    size = sizeof(approved);
+    if (RegGetValueW(HKEY_CURRENT_USER, STARTUP_APPROVED_RUN_KEY_W, APP_NAME,
+                     RRF_RT_REG_BINARY, NULL, approved, &size) != ERROR_SUCCESS ||
+        size == 0) {
+        return TRUE; // No marker (or Windows 7, which has none) means enabled.
+    }
+    return (approved[0] & 1) == 0;
+}
+
+static LONG SetStartWithWindows(BOOL enable) {
+    LONG result;
+    if (enable) {
+        wchar_t command[MAX_PATH + 2];
+        HKEY key;
+        if (!GetStartupCommand(command, sizeof(command) / sizeof(wchar_t))) {
+            return ERROR_BAD_PATHNAME;
+        }
+        result = RegCreateKeyExW(HKEY_CURRENT_USER, STARTUP_RUN_KEY_W, 0, NULL,
+                                 REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL,
+                                 &key, NULL);
+        if (result != ERROR_SUCCESS) return result;
+        result = RegSetValueExW(key, APP_NAME, 0, REG_SZ, (const BYTE*)command,
+                                (DWORD)((wcslen(command) + 1) * sizeof(wchar_t)));
+        RegCloseKey(key);
+    } else {
+        result = RegDeleteKeyValueW(HKEY_CURRENT_USER, STARTUP_RUN_KEY_W, APP_NAME);
+        if (result == ERROR_FILE_NOT_FOUND) result = ERROR_SUCCESS;
+    }
+    if (result != ERROR_SUCCESS) return result;
+
+    // Drop any disabled marker so turning the option on takes effect and
+    // turning it off leaves nothing behind.
+    result = RegDeleteKeyValueW(HKEY_CURRENT_USER, STARTUP_APPROVED_RUN_KEY_W,
+                                APP_NAME);
+    return result == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : result;
 }
 
 // INI fallback for one-time migration from old config.ini
@@ -3575,10 +3639,11 @@ static void webview_push_init_config(void) {
 
     wchar_t script[4608];
     swprintf(script, sizeof(script) / sizeof(wchar_t),
-        L"window.onInit({\"view\":\"config\",\"config\":{\"url\":\"%s\",\"healthyInterval\":%d,\"downInterval\":%d,\"loggingEnabled\":%s,\"historyLimit\":%d,\"logPath\":\"%s\",\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
+        L"window.onInit({\"view\":\"config\",\"config\":{\"url\":\"%s\",\"healthyInterval\":%d,\"downInterval\":%d,\"loggingEnabled\":%s,\"historyLimit\":%d,\"logPath\":\"%s\",\"startWithWindows\":%s,\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
         wUrl, configRefreshInterval, configDownRefreshInterval,
         configLoggingEnabled ? L"true" : L"false",
         configHistoryLimit, wLogPath,
+        IsStartWithWindowsEnabled() ? L"true" : L"false",
         configAutoCheckForUpdates ? L"true" : L"false",
         updatePending ? L"true" : L"false",
         g_updateNoticeTask ? L"true" : L"false",
@@ -3847,12 +3912,15 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         int downInterval = 10;
         BOOL logging = TRUE;
         BOOL autoUpdate = configAutoCheckForUpdates;
+        BOOL startWithWindows = FALSE;
         int histLimit = 100;
         json_get_string(msg, "url", url, sizeof(url));
         json_get_int(msg, "healthyInterval", &healthyInterval);
         json_get_int(msg, "downInterval", &downInterval);
         json_get_bool(msg, "loggingEnabled", &logging);
         json_get_bool(msg, "autoCheckForUpdates", &autoUpdate);
+        BOOL hasStartWithWindows =
+            json_get_bool(msg, "startWithWindows", &startWithWindows);
         json_get_int(msg, "historyLimit", &histLimit);
 
         if (url[0]) {
@@ -3877,9 +3945,20 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         SaveConfigToRegistry();
         MarkAsConfigured();
         ApplyConfiguration();
-        LogMessage("Configuration updated via WebView dialog: URL=%s, HealthyInterval=%d, DownInterval=%d, Logging=%s, HistoryLimit=%d, AutoUpdate=%s",
+        // Only a changed toggle touches the Run entry, so an entry for another
+        // copy of the executable is left alone unless the user turns this on.
+        if (hasStartWithWindows &&
+            startWithWindows != IsStartWithWindowsEnabled()) {
+            LONG startupResult = SetStartWithWindows(startWithWindows);
+            if (startupResult != ERROR_SUCCESS) {
+                LogMessage("ERROR: Failed to %s start with Windows. Error: %ld",
+                           startWithWindows ? "enable" : "disable", startupResult);
+            }
+        }
+        LogMessage("Configuration updated via WebView dialog: URL=%s, HealthyInterval=%d, DownInterval=%d, Logging=%s, HistoryLimit=%d, StartWithWindows=%s, AutoUpdate=%s",
                    configApiUrl, configRefreshInterval, configDownRefreshInterval,
                    configLoggingEnabled ? "enabled" : "disabled", configHistoryLimit,
+                   IsStartWithWindowsEnabled() ? "enabled" : "disabled",
                    configAutoCheckForUpdates ? "enabled" : "disabled");
         PostMessage(g_webviewHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "close") == 0) {

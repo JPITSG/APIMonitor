@@ -39,6 +39,9 @@ export default function ConfigView({
   const [downInterval, setDownInterval] = useState(config.downInterval ?? 10);
   const [loggingEnabled, setLoggingEnabled] = useState(config.loggingEnabled);
   const [historyLimit, setHistoryLimit] = useState(String(config.historyLimit));
+  const [startWithWindows, setStartWithWindows] = useState(
+    config.startWithWindows ?? false
+  );
   const [autoCheckForUpdates, setAutoCheckForUpdates] = useState(
     config.autoCheckForUpdates ?? true
   );
@@ -198,6 +201,7 @@ export default function ConfigView({
       downInterval,
       loggingEnabled,
       historyLimit: hl,
+      startWithWindows,
       autoCheckForUpdates,
       updateCheckPending: config.updateCheckPending,
       updatePromptPending: config.updatePromptPending,
@@ -288,6 +292,16 @@ export default function ConfigView({
           value={historyLimit}
           onChange={(e) => setHistoryLimit(e.target.value)}
           className="w-40"
+        />
+      </div>
+
+      <div data-row className="flex items-center justify-between">
+        <Label htmlFor="start-with-windows">Start with Windows</Label>
+        <Switch
+          id="start-with-windows"
+          checked={startWithWindows}
+          onCheckedChange={setStartWithWindows}
+          className="shrink-0"
         />
       </div>
 

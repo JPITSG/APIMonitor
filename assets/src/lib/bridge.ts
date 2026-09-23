@@ -5,6 +5,7 @@ export interface ConfigData {
   loggingEnabled: boolean;
   historyLimit: number;
   logPath?: string;
+  startWithWindows: boolean;
   autoCheckForUpdates: boolean;
   updateCheckPending: boolean;
   updatePromptPending: boolean;
@@ -145,6 +146,7 @@ export function saveSettings(config: ConfigData) {
     downInterval: config.downInterval,
     loggingEnabled: config.loggingEnabled,
     historyLimit: config.historyLimit,
+    startWithWindows: config.startWithWindows,
     autoCheckForUpdates: config.autoCheckForUpdates,
   });
 }

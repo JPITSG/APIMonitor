@@ -11,6 +11,7 @@ A Windows system tray application that monitors an API endpoint and displays its
 - Status change history with timestamps, copy-to-clipboard, and clear, opened by double-clicking the tray icon or from its right-click menu under **History**
 - Configuration stored in the Windows registry (`HKCU\SOFTWARE\JPIT\APIMonitor`)
 - First-launch configuration dialog
+- Optional start with Windows at sign-in (per user, no administrator rights needed)
 - Automatic retry on network errors (3 attempts, 2s delay)
 - Independently configurable polling intervals for healthy and non-success states
 - Completion-driven polling that never runs more than one API check at a time
@@ -95,9 +96,14 @@ On first launch a configuration dialog is shown. It can also be opened from the 
 | Something Down Interval | `DownRefreshInterval` | REG_DWORD | `10` (seconds) |
 | Enable Logging | `LoggingEnabled` | REG_DWORD | `1` |
 | History Limit | `HistoryLimit` | REG_DWORD | `100` (10–10,000) |
+| Start with Windows | `APIMonitor` (see below) | REG_SZ | Off |
 | Automatically Check for Updates | `AutoCheckForUpdates` | REG_DWORD | `1` |
 
-Settings are stored under `HKEY_CURRENT_USER\SOFTWARE\JPIT\APIMonitor`.
+Settings are stored under `HKEY_CURRENT_USER\SOFTWARE\JPIT\APIMonitor`, except
+**Start with Windows**: it adds or removes an `APIMonitor` value under
+`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` that launches
+this executable when you sign in. An entry disabled in Task Manager's startup
+apps shows as off; turning the toggle on re-enables it.
 
 If a `config.ini` file exists from a previous version, settings are migrated to the registry on first launch.
 
