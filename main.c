@@ -370,6 +370,7 @@ static ICoreWebView2Controller *g_webviewController = NULL;
 static ICoreWebView2 *g_webviewView = NULL;
 static char g_pendingView[16] = "";
 static BOOL g_webviewWindowShown = FALSE;
+static SIZE g_webviewFrameSize = {0, 0};
 static BOOL g_configViewReady = FALSE;
 static BOOL g_updateConfirmationPending = FALSE;
 static wchar_t g_webView2Version[128] = L"Unknown";
@@ -2079,6 +2080,87 @@ static void webview_sync_controller_bounds(void) {
     GetClientRect(g_webviewHwnd, &bounds);
     g_webviewController->lpVtbl->put_Bounds(g_webviewController, bounds);
     g_webviewController->lpVtbl->put_IsVisible(g_webviewController, TRUE);
+}
+
+// ============================================================================
+// Fixed-size dialog frame
+// ============================================================================
+
+// The dialog keeps the standard overlapped frame, so Windows draws the
+// normal caption height, but only the app sizes it (to fit the page's
+// content); the user cannot. Edge and corner hits become caption or border
+// hits, Size and Maximize leave the system menu and are refused as commands,
+// and the track size is pinned to the size the app last chose, which also
+// keeps Aero Snap and the taskbar's window arrangements from stretching it.
+// Every size the app gives the window goes through FixedFrameSetPos.
+#define FIXED_FRAME_STYLE (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX)
+
+// Runs first in the dialog's window procedure; returns TRUE with *result
+// set for a message it answered.
+static BOOL FixedFrameMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                              SIZE *size, LRESULT *result) {
+    switch (msg) {
+        case WM_NCHITTEST:
+            *result = DefWindowProcW(hwnd, msg, wParam, lParam);
+            switch (*result) {
+                case HTTOP: case HTTOPLEFT: case HTTOPRIGHT:
+                    *result = HTCAPTION;
+                    break;
+                case HTLEFT: case HTRIGHT: case HTBOTTOM:
+                case HTBOTTOMLEFT: case HTBOTTOMRIGHT:
+                    *result = HTBORDER;
+                    break;
+            }
+            return TRUE;
+
+        case WM_SYSCOMMAND:
+            if ((wParam & 0xFFF0) != SC_SIZE && (wParam & 0xFFF0) != SC_MAXIMIZE) {
+                return FALSE;
+            }
+            *result = 0;
+            return TRUE;
+
+        case WM_GETMINMAXINFO: {
+            if (size->cx <= 0 || size->cy <= 0) return FALSE;
+            MINMAXINFO *info = (MINMAXINFO *)lParam;
+            if (info->ptMinTrackSize.x < size->cx) info->ptMinTrackSize.x = size->cx;
+            if (info->ptMinTrackSize.y < size->cy) info->ptMinTrackSize.y = size->cy;
+            info->ptMaxTrackSize = info->ptMinTrackSize;
+            *result = 0;
+            return TRUE;
+        }
+
+        case WM_NCDESTROY:
+            size->cx = size->cy = 0;
+            return FALSE;
+    }
+    return FALSE;
+}
+
+// Called once CreateWindowExW has returned: pins the size it gave the
+// window and takes Size and Maximize out of the system menu.
+static void FixedFrameInit(HWND hwnd, SIZE *size) {
+    RECT rect;
+    if (GetWindowRect(hwnd, &rect)) {
+        size->cx = rect.right - rect.left;
+        size->cy = rect.bottom - rect.top;
+    }
+    HMENU menu = GetSystemMenu(hwnd, FALSE);
+    if (menu) {
+        DeleteMenu(menu, SC_SIZE, MF_BYCOMMAND);
+        DeleteMenu(menu, SC_MAXIMIZE, MF_BYCOMMAND);
+    }
+}
+
+// SetWindowPos for the app's own sizing: the new size is pinned first, so
+// the track limits admit exactly it.
+static BOOL FixedFrameSetPos(HWND hwnd, SIZE *size, int x, int y, int width,
+                             int height, UINT flags) {
+    if (!(flags & SWP_NOSIZE)) {
+        size->cx = width;
+        size->cy = height;
+    }
+    return SetWindowPos(hwnd, NULL, x, y, width, height, flags);
 }
 
 // Minimal JSON parser helpers
@@ -4012,8 +4094,8 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
                 flags |= SWP_SHOWWINDOW;
                 KillTimer(g_webviewHwnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK);
             }
-            SetWindowPos(g_webviewHwnd, NULL, posX, posY,
-                         windowW, newWindowH, flags);
+            FixedFrameSetPos(g_webviewHwnd, &g_webviewFrameSize, posX, posY,
+                             windowW, newWindowH, flags);
             g_webviewWindowShown = TRUE;
             webview_sync_controller_bounds();
         }
@@ -4028,6 +4110,10 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
 // ============================================================================
 
 static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    LRESULT frameResult;
+    if (FixedFrameMessage(hwnd, msg, wParam, lParam, &g_webviewFrameSize, &frameResult)) {
+        return frameResult;
+    }
     switch (msg) {
         case WM_APP_UPDATE_RESULT: {
             UpdateCheckTask* task = (UpdateCheckTask*)InterlockedExchangePointer(
@@ -4042,10 +4128,10 @@ static LRESULT CALLBACK WebViewWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
         case WM_DPICHANGED: {
             const RECT* suggested = (const RECT*)lParam;
-            SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
-                         suggested->right - suggested->left,
-                         suggested->bottom - suggested->top,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
+            FixedFrameSetPos(hwnd, &g_webviewFrameSize, suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
             return 0;
         }
 
@@ -4165,7 +4251,7 @@ static void ShowWebViewDialog(const char* view, int width, int height) {
     int posY = workArea.top + (workH - height) / 2;
 
     g_webviewHwnd = CreateWindowExW(0, L"APIMonitorWebViewWnd", title,
-        WS_OVERLAPPEDWINDOW,
+        FIXED_FRAME_STYLE,
         posX, posY, width, height,
         NULL, NULL, g_hInstance, NULL);
 
@@ -4173,6 +4259,7 @@ static void ShowWebViewDialog(const char* view, int width, int height) {
         LogMessage("ERROR: Failed to create WebView2 window.");
         return;
     }
+    FixedFrameInit(g_webviewHwnd, &g_webviewFrameSize);
     g_webviewWindowShown = FALSE;
     SetTimer(g_webviewHwnd, ID_TIMER_WEBVIEW_SHOW_FALLBACK, WEBVIEW_SHOW_FALLBACK_DELAY_MS, NULL);
 
