@@ -295,13 +295,18 @@ export default function ConfigView({
         />
       </div>
 
-      <div data-row className="flex items-center justify-between">
-        <Label htmlFor="start-with-windows">Start with Windows</Label>
+      <div data-row className="flex items-start justify-between gap-3">
+        <div className="flex flex-col">
+          <Label htmlFor="start-with-windows">Start with Windows</Label>
+          <span className="text-[10px] text-neutral-500 leading-tight mt-1.5">
+            Launches in the tray when you sign in to Windows.
+          </span>
+        </div>
         <Switch
           id="start-with-windows"
           checked={startWithWindows}
           onCheckedChange={setStartWithWindows}
-          className="shrink-0"
+          className="shrink-0 mt-0.5"
         />
       </div>
 
