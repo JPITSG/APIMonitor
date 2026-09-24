@@ -21,3 +21,10 @@ place the app sizes it pins the size first.
 
 These checks do not verify Windows WebView2, UAC, executable replacement, or
 process restart behavior on Windows.
+
+Run `python3 tests/test_config_close.py` for the native configuration close gate.
+After `make`, run `node tests/ui_config_close.cjs` with the same Puppeteer setup
+as above. It checks all editable settings, reverting edits, native and footer
+close requests, save/discard/keep editing, Escape and Tab, empty URL handling,
+and update notices arriving while the save prompt is open. The screenshot is
+written to `/tmp/apimonitor-unsaved-changes.png`.

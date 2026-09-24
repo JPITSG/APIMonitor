@@ -58,6 +58,7 @@ let validationCallback: ValidationCallback | null = null;
 let historyUpdateCallback: HistoryUpdateCallback | null = null;
 let updateResultCallback: ((result: UpdateResult) => void) | null = null;
 let updateProgressCallback: ((progress: UpdateProgress) => void) | null = null;
+let closeRequestedCallback: (() => void) | null = null;
 
 // Extend window for C <-> JS bridge
 declare global {
@@ -67,6 +68,7 @@ declare global {
     onHistoryUpdate: (entries: HistoryEntry[]) => void;
     onUpdateResult: (result: UpdateResult) => void;
     onUpdateProgress: (progress: UpdateProgress) => void;
+    onCloseRequested: () => void;
     chrome?: {
       webview?: {
         postMessage: (s: string) => void;
@@ -95,6 +97,17 @@ window.onUpdateResult = (result: UpdateResult) => {
 window.onUpdateProgress = (progress: UpdateProgress) => {
   updateProgressCallback?.(progress);
 };
+
+window.onCloseRequested = () => {
+  closeRequestedCallback?.();
+};
+
+export function onCloseRequested(cb: () => void) {
+  closeRequestedCallback = cb;
+  return () => {
+    if (closeRequestedCallback === cb) closeRequestedCallback = null;
+  };
+}
 
 export function onInit(cb: InitCallback) {
   initCallback = cb;

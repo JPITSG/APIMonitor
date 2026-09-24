@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
+import ConfigAlert from "./components/ConfigAlert";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { Switch } from "./components/ui/switch";
@@ -9,6 +10,7 @@ import {
   validateUrl,
   saveSettings,
   closeDialog,
+  onCloseRequested,
   configReady,
   checkForUpdate,
   cancelUpdateCheck,
@@ -70,6 +72,38 @@ export default function ConfigView({
       : null
   );
   const automaticUpdateStarted = useRef(false);
+  const [closePrompt, setClosePrompt] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const hasChanges =
+    url !== config.url ||
+    healthyInterval !== (config.healthyInterval ?? 60) ||
+    downInterval !== (config.downInterval ?? 10) ||
+    loggingEnabled !== config.loggingEnabled ||
+    historyLimit !== String(config.historyLimit) ||
+    startWithWindows !== (config.startWithWindows ?? false) ||
+    autoCheckForUpdates !== (config.autoCheckForUpdates ?? true);
+
+  const handleRequestClose = useCallback(() => {
+    if (hasChanges) {
+      setClosePrompt(true);
+    } else {
+      closeDialog();
+    }
+  }, [hasChanges]);
+
+  // Install before configReady, and keep native close requests in sync with edits.
+  useLayoutEffect(() => onCloseRequested(handleRequestClose), [handleRequestClose]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !closePrompt && !updateAlert) {
+        event.preventDefault();
+        handleRequestClose();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [closePrompt, updateAlert, handleRequestClose]);
 
   const handleValidationResult = useCallback((result: ValidationResult) => {
     setValidationState(result.valid ? 2 : 3);
@@ -172,6 +206,7 @@ export default function ConfigView({
 
   const handleUrlChange = (newUrl: string) => {
     setUrl(newUrl);
+    setSaveError("");
 
     if (debounceRef.current) clearTimeout(debounceRef.current);
 
@@ -189,7 +224,12 @@ export default function ConfigView({
 
   const handleSave = () => {
     const trimmedUrl = url.trim();
-    if (!trimmedUrl) return;
+    if (!trimmedUrl) {
+      setSaveError("Enter an API URL.");
+      setClosePrompt(false);
+      requestAnimationFrame(() => document.getElementById("api-url")?.focus());
+      return;
+    }
 
     let hl = parseInt(historyLimit, 10);
     if (isNaN(hl) || hl < 10) hl = 10;
@@ -222,245 +262,257 @@ export default function ConfigView({
   };
 
   return (
-    <div className="p-5 flex flex-col gap-3 max-w-md mx-auto text-xs">
-      <div data-row className="flex items-center justify-between gap-3">
-        <Label htmlFor="api-url" className="shrink-0">API URL</Label>
-        <Input
-          id="api-url"
-          value={url}
-          onChange={(e) => handleUrlChange(e.target.value)}
-          placeholder="http://example.com/api/status"
-          className="flex-1 min-w-0"
-        />
-      </div>
-
-      <div data-row className="flex items-center justify-between">
-        <Label>API URL Status</Label>
-        {validationBadge()}
-      </div>
-
-      <div data-row className="flex items-center justify-between">
-        <Label htmlFor="healthy-interval">Check When Everything Is OK</Label>
-        <select
-          id="healthy-interval"
-          value={healthyInterval}
-          onChange={(e) => setHealthyInterval(Number(e.target.value))}
-          className="w-40 h-8 rounded-md border border-neutral-300 bg-transparent px-3 py-1 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400"
-        >
-          <option value={60}>Every 1 minute</option>
-          <option value={120}>Every 2 minutes</option>
-          <option value={300}>Every 5 minutes</option>
-        </select>
-      </div>
-
-      <div data-row className="flex items-center justify-between">
-        <Label htmlFor="down-interval">Check When Something Is Down</Label>
-        <select
-          id="down-interval"
-          value={downInterval}
-          onChange={(e) => setDownInterval(Number(e.target.value))}
-          className="w-40 h-8 rounded-md border border-neutral-300 bg-transparent px-3 py-1 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400"
-        >
-          <option value={10}>Every 10 seconds</option>
-          <option value={30}>Every 30 seconds</option>
-          <option value={60}>Every 1 minute</option>
-          <option value={120}>Every 2 minutes</option>
-          <option value={300}>Every 5 minutes</option>
-        </select>
-      </div>
-
-      <div data-row className="flex items-start justify-between gap-3">
-        <div className="flex flex-col">
-          <Label htmlFor="logging">Enable Debug Logging</Label>
-          <span className="text-[10px] text-neutral-500 break-all leading-tight mt-1.5">({config.logPath})</span>
+    <>
+      <div inert={closePrompt || !!updateAlert} className="p-5 flex flex-col gap-3 max-w-md mx-auto text-xs">
+        <div data-row className="flex items-center justify-between gap-3">
+          <Label htmlFor="api-url" className="shrink-0">API URL</Label>
+          <Input
+            id="api-url"
+            aria-invalid={!!saveError}
+            aria-describedby={saveError ? "save-error" : undefined}
+            value={url}
+            onChange={(e) => handleUrlChange(e.target.value)}
+            placeholder="http://example.com/api/status"
+            className="flex-1 min-w-0"
+          />
         </div>
-        <Switch
-          id="logging"
-          checked={loggingEnabled}
-          onCheckedChange={setLoggingEnabled}
-          className="shrink-0 mt-0.5"
-        />
-      </div>
 
-      <div data-row className="flex items-center justify-between">
-        <Label htmlFor="history-limit">History Limit (10-10000)</Label>
-        <Input
-          id="history-limit"
-          type="number"
-          min={10}
-          max={10000}
-          value={historyLimit}
-          onChange={(e) => setHistoryLimit(e.target.value)}
-          className="w-40"
-        />
-      </div>
+        {saveError && <p id="save-error" role="alert" className="text-red-600">{saveError}</p>}
 
-      <div data-row className="flex items-start justify-between gap-3">
-        <div className="flex flex-col">
-          <Label htmlFor="start-with-windows">Start with Windows</Label>
-          <span className="text-[10px] text-neutral-500 leading-tight mt-1.5">
-            Launches in the tray when you sign in to Windows.
+        <div data-row className="flex items-center justify-between">
+          <Label>API URL Status</Label>
+          {validationBadge()}
+        </div>
+
+        <div data-row className="flex items-center justify-between">
+          <Label htmlFor="healthy-interval">Check When Everything Is OK</Label>
+          <select
+            id="healthy-interval"
+            value={healthyInterval}
+            onChange={(e) => setHealthyInterval(Number(e.target.value))}
+            className="w-40 h-8 rounded-md border border-neutral-300 bg-transparent px-3 py-1 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400"
+          >
+            <option value={60}>Every 1 minute</option>
+            <option value={120}>Every 2 minutes</option>
+            <option value={300}>Every 5 minutes</option>
+          </select>
+        </div>
+
+        <div data-row className="flex items-center justify-between">
+          <Label htmlFor="down-interval">Check When Something Is Down</Label>
+          <select
+            id="down-interval"
+            value={downInterval}
+            onChange={(e) => setDownInterval(Number(e.target.value))}
+            className="w-40 h-8 rounded-md border border-neutral-300 bg-transparent px-3 py-1 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400"
+          >
+            <option value={10}>Every 10 seconds</option>
+            <option value={30}>Every 30 seconds</option>
+            <option value={60}>Every 1 minute</option>
+            <option value={120}>Every 2 minutes</option>
+            <option value={300}>Every 5 minutes</option>
+          </select>
+        </div>
+
+        <div data-row className="flex items-start justify-between gap-3">
+          <div className="flex flex-col">
+            <Label htmlFor="logging">Enable Debug Logging</Label>
+            <span className="text-[10px] text-neutral-500 break-all leading-tight mt-1.5">({config.logPath})</span>
+          </div>
+          <Switch
+            id="logging"
+            checked={loggingEnabled}
+            onCheckedChange={setLoggingEnabled}
+            className="shrink-0 mt-0.5"
+          />
+        </div>
+
+        <div data-row className="flex items-center justify-between">
+          <Label htmlFor="history-limit">History Limit (10-10000)</Label>
+          <Input
+            id="history-limit"
+            type="number"
+            min={10}
+            max={10000}
+            value={historyLimit}
+            onChange={(e) => setHistoryLimit(e.target.value)}
+            className="w-40"
+          />
+        </div>
+
+        <div data-row className="flex items-start justify-between gap-3">
+          <div className="flex flex-col">
+            <Label htmlFor="start-with-windows">Start with Windows</Label>
+            <span className="text-[10px] text-neutral-500 leading-tight mt-1.5">
+              Launches in the tray when you sign in to Windows.
+            </span>
+          </div>
+          <Switch
+            id="start-with-windows"
+            checked={startWithWindows}
+            onCheckedChange={setStartWithWindows}
+            className="shrink-0 mt-0.5"
+          />
+        </div>
+
+        <div data-row className="flex items-start justify-between gap-3">
+          <div className="flex flex-col">
+            <Label htmlFor="auto-update">Automatically Check for Updates</Label>
+            <span className="text-[10px] text-neutral-500 leading-tight mt-1.5">
+              Checks at startup, when Configure opens, and every 60 minutes.
+            </span>
+          </div>
+          <Switch
+            id="auto-update"
+            checked={autoCheckForUpdates}
+            onCheckedChange={setAutoCheckForUpdates}
+            className="shrink-0 mt-0.5"
+          />
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+          <span
+            className="select-none whitespace-nowrap text-[10px] leading-none tabular-nums text-neutral-400"
+            title="Application version"
+          >
+            v{__APP_VERSION__}
           </span>
-        </div>
-        <Switch
-          id="start-with-windows"
-          checked={startWithWindows}
-          onCheckedChange={setStartWithWindows}
-          className="shrink-0 mt-0.5"
-        />
-      </div>
-
-      <div data-row className="flex items-start justify-between gap-3">
-        <div className="flex flex-col">
-          <Label htmlFor="auto-update">Automatically Check for Updates</Label>
-          <span className="text-[10px] text-neutral-500 leading-tight mt-1.5">
-            Checks at startup, when Configure opens, and every 60 minutes.
-          </span>
-        </div>
-        <Switch
-          id="auto-update"
-          checked={autoCheckForUpdates}
-          onCheckedChange={setAutoCheckForUpdates}
-          className="shrink-0 mt-0.5"
-        />
-      </div>
-
-      <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-        <span
-          className="select-none whitespace-nowrap text-[10px] leading-none tabular-nums text-neutral-400"
-          title="Application version"
-        >
-          v{__APP_VERSION__}
-        </span>
-        <div className="flex items-center gap-2">
-          <Button
-            variant={updateChecking ? "destructive" : "outline"}
-            size="sm"
-            className="min-w-[5rem] tabular-nums"
-            disabled={updateCancelling}
-            aria-label={
-              updateChecking ? "Stop update check and download" : undefined
-            }
-            title={
-              updateChecking ? "Stop update check and download" : undefined
-            }
-            onClick={handleUpdate}
-          >
-            {updateCancelling
-              ? "Stopping..."
-              : updateChecking
-                ? updateProgressPercent === null
-                  ? "Checking..."
-                  : `Checking (${updateProgressPercent}%)...`
-                : "Update"}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="min-w-[5rem]"
-            onClick={() => closeDialog()}
-          >
-            Cancel
-          </Button>
-          <Button size="sm" className="min-w-[5rem]" onClick={handleSave}>
-            Save
-          </Button>
-        </div>
-      </div>
-
-      {updateAlert && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 p-4">
-          <div
-            role="alertdialog"
-            aria-modal="true"
-            aria-labelledby="update-alert-title"
-            aria-describedby="update-alert-message"
-            className="w-full max-w-sm space-y-3 rounded-lg border border-neutral-200 bg-white p-4 shadow-xl"
-          >
-            <div className="space-y-1">
-              <h2 id="update-alert-title" className="text-sm font-semibold">
-                {updateAlert.title}
-              </h2>
-              <p
-                id="update-alert-message"
-                className="text-xs leading-relaxed text-neutral-600"
-              >
-                {updateAlert.message}
-              </p>
-            </div>
-            {updateAlert.currentVersion && updateAlert.remoteVersion && (
-              <dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
-                <dt className="text-neutral-500">Current version</dt>
-                <dd className="font-medium tabular-nums text-neutral-900">
-                  {updateAlert.currentVersion}
-                </dd>
-                <dt className="text-neutral-500">Remote version</dt>
-                <dd className="font-medium tabular-nums text-neutral-900">
-                  {updateAlert.remoteVersion}
-                </dd>
-              </dl>
-            )}
-            {(updateAlert.status === "newer" || updateAlert.status === "same") && (
-              <label className="flex items-center gap-2 text-xs text-neutral-600">
-                <input
-                  type="checkbox"
-                  checked={reopenSettingsAfterUpdate}
-                  onChange={(event) => setReopenSettingsAfterUpdate(event.target.checked)}
-                  disabled={updateChecking}
-                  className="h-3.5 w-3.5 rounded border-neutral-300 accent-neutral-900"
-                />
-                Reopen settings after update
-              </label>
-            )}
-            <div className="flex justify-end gap-2">
-              {updateAlert.status === "newer" && updateAlert.automatic && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={updateChecking}
-                  onClick={handleIgnoreUpdateVersion}
-                >
-                  Ignore this version
-                </Button>
-              )}
-              {(updateAlert.status === "newer" ||
-                updateAlert.status === "same") && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  autoFocus
-                  disabled={updateChecking}
-                  onClick={handleDismissUpdate}
-                >
-                  Cancel
-                </Button>
-              )}
-              <Button
-                size="sm"
-                autoFocus={
-                  updateAlert.status !== "newer" &&
-                  updateAlert.status !== "same"
-                }
-                disabled={updateChecking}
-                onClick={
-                  updateAlert.status === "newer" ||
-                  updateAlert.status === "same"
-                    ? handleInstallUpdate
-                    : handleDismissUpdate
-                }
-              >
-                {updateChecking
-                  ? "Starting..."
-                  : updateAlert.status === "same"
-                    ? "Force update"
-                    : updateAlert.status === "newer"
-                      ? "Update"
-                      : "OK"}
-              </Button>
-            </div>
+          <div className="flex items-center gap-2">
+            <Button
+              variant={updateChecking ? "destructive" : "outline"}
+              size="sm"
+              className="min-w-[5rem] tabular-nums"
+              disabled={updateCancelling}
+              aria-label={
+                updateChecking ? "Stop update check and download" : undefined
+              }
+              title={
+                updateChecking ? "Stop update check and download" : undefined
+              }
+              onClick={handleUpdate}
+            >
+              {updateCancelling
+                ? "Stopping..."
+                : updateChecking
+                  ? updateProgressPercent === null
+                    ? "Checking..."
+                    : `Checking (${updateProgressPercent}%)...`
+                  : "Update"}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="min-w-[5rem]"
+              onClick={handleRequestClose}
+            >
+              Cancel
+            </Button>
+            <Button size="sm" className="min-w-[5rem]" onClick={handleSave}>
+              Save
+            </Button>
           </div>
         </div>
+      </div>
+
+      {closePrompt ? (
+        <ConfigAlert
+          key="save"
+          id="save-alert"
+          title="Unsaved changes"
+          message="Save changes before closing?"
+          onEscape={() => setClosePrompt(false)}
+        >
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" size="sm" onClick={() => setClosePrompt(false)}>
+              Keep editing
+            </Button>
+            <Button variant="outline" size="sm" onClick={closeDialog}>
+              Discard
+            </Button>
+            <Button size="sm" onClick={handleSave}>
+              Save
+            </Button>
+          </div>
+        </ConfigAlert>
+      ) : updateAlert && (
+        <ConfigAlert
+          key="update"
+          id="update-alert"
+          title={updateAlert.title}
+          message={updateAlert.message}
+        >
+          {updateAlert.currentVersion && updateAlert.remoteVersion && (
+            <dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
+              <dt className="text-neutral-500">Current version</dt>
+              <dd className="font-medium tabular-nums text-neutral-900">
+                {updateAlert.currentVersion}
+              </dd>
+              <dt className="text-neutral-500">Remote version</dt>
+              <dd className="font-medium tabular-nums text-neutral-900">
+                {updateAlert.remoteVersion}
+              </dd>
+            </dl>
+          )}
+          {(updateAlert.status === "newer" || updateAlert.status === "same") && (
+            <label className="flex items-center gap-2 text-xs text-neutral-600">
+              <input
+                type="checkbox"
+                checked={reopenSettingsAfterUpdate}
+                onChange={(event) => setReopenSettingsAfterUpdate(event.target.checked)}
+                disabled={updateChecking}
+                className="h-3.5 w-3.5 rounded border-neutral-300 accent-neutral-900"
+              />
+              Reopen settings after update
+            </label>
+          )}
+          <div className="flex justify-end gap-2">
+            {updateAlert.status === "newer" && updateAlert.automatic && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={updateChecking}
+                onClick={handleIgnoreUpdateVersion}
+              >
+                Ignore this version
+              </Button>
+            )}
+            {(updateAlert.status === "newer" ||
+              updateAlert.status === "same") && (
+              <Button
+                variant="outline"
+                size="sm"
+                autoFocus
+                disabled={updateChecking}
+                onClick={handleDismissUpdate}
+              >
+                Cancel
+              </Button>
+            )}
+            <Button
+              size="sm"
+              autoFocus={
+                updateAlert.status !== "newer" &&
+                updateAlert.status !== "same"
+              }
+              disabled={updateChecking}
+              onClick={
+                updateAlert.status === "newer" ||
+                updateAlert.status === "same"
+                  ? handleInstallUpdate
+                  : handleDismissUpdate
+              }
+            >
+              {updateChecking
+                ? "Starting..."
+                : updateAlert.status === "same"
+                  ? "Force update"
+                  : updateAlert.status === "newer"
+                    ? "Update"
+                    : "OK"}
+            </Button>
+          </div>
+        </ConfigAlert>
       )}
-    </div>
+    </>
   );
 }

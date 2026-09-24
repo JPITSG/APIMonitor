@@ -90,6 +90,9 @@ make clean
 
 On first launch a configuration dialog is shown. It can also be opened from the tray icon right-click menu under **Configure**.
 
+Closing with unsaved changes asks whether to **Save**, **Discard**, or **Keep editing**.
+This applies to Cancel, Escape, the window's Close button, and Alt+F4.
+
 | Setting | Registry Value | Type | Default |
 |---------|---------------|------|---------|
 | API URL | `ApiUrl` | REG_SZ | `http://example.com/api/status` |
