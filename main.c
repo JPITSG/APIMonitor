@@ -31,6 +31,9 @@
 #define WM_DPICHANGED 0x02E0
 #endif
 
+#define ID_TIMER_TRAY_RETRY 1009
+#define TRAY_RETRY_MS 2000
+
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_REFRESH 1002
@@ -57,6 +60,7 @@
 #define WM_VALIDATE_RESULT      (WM_APP + 1)
 #define WM_APP_UPDATE_RESULT    (WM_APP + 2)
 #define WM_APP_REFRESH_COMPLETE (WM_APP + 4)
+#define WM_APP_TRAY_UPDATE      (WM_APP + 5)
 #define WM_SHOW_FIRST_CONFIG    (WM_USER + 2)
 #define ID_TIMER_REFRESH 1
 #define ID_TIMER_TOOLTIP 2
@@ -102,6 +106,20 @@ typedef struct {
 
 // Global variables
 static NOTIFYICONDATA nid = {0};
+static UINT g_WM_TASKBARCREATED = 0;
+static BOOL g_trayActive = FALSE;
+static BOOL g_trayRegistered = FALSE;
+static BOOL g_trayRetryPending = FALSE;
+static void PublishTrayIcon(void);
+static void StopTrayRegistration(void);
+static void RegisterTaskbarMessage(HWND hwnd);
+typedef struct {
+    UINT flags;
+    HICON icon;
+    char tip[128];
+} TrayUpdate;
+static void ApplyTrayUpdate(const TrayUpdate* update);
+static void QueueTrayUpdate(UINT flags, HICON icon, const char* tip);
 static HMENU hMenu = NULL;
 static char configApiUrl[512] = "http://example.com/api/status";
 static int configRefreshInterval = 60;
@@ -636,9 +654,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Create hidden message window
-    HWND hwnd = CreateWindowExA(0, "APIMonitorClass", "APIMonitor", 0,
-                              0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, NULL);
+    // Hidden top-level window receives TaskbarCreated broadcasts.
+    HWND hwnd = CreateWindowExA(WS_EX_TOOLWINDOW, "APIMonitorClass", "APIMonitor", 0,
+                              0, 0, 0, 0, NULL, NULL, hInstance, NULL);
     if (!hwnd) {
         LogMessage("ERROR: Failed to create window. Error: %lu", GetLastError());
         MessageBoxA(NULL, "Failed to create window", "Error", MB_OK | MB_ICONERROR);
@@ -653,6 +671,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (configAutoCheckForUpdates) StartUpdateCheck(TRUE);
 
     // Initialize tray icon
+    RegisterTaskbarMessage(hwnd);
     InitTrayIcon(hwnd);
     LogMessage("Tray icon initialized.");
 
@@ -691,11 +710,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (g_WM_TASKBARCREATED != 0 && uMsg == g_WM_TASKBARCREATED) {
+        g_trayRegistered = FALSE;
+        PublishTrayIcon();
+        return 0;
+    }
+    if (uMsg == WM_TIMER && wParam == ID_TIMER_TRAY_RETRY) {
+        if (g_trayRetryPending) PublishTrayIcon();
+        return 0;
+    }
     switch (uMsg) {
         case WM_APP_UPDATE_RESULT: {
             UpdateCheckTask* task = (UpdateCheckTask*)InterlockedExchangePointer(
                 (PVOID volatile*)&g_updatePostedResult, NULL);
             HandleCompletedUpdateCheck(task);
+            return 0;
+        }
+
+        case WM_APP_TRAY_UPDATE: {
+            TrayUpdate* update = (TrayUpdate*)lParam;
+            ApplyTrayUpdate(update);
+            free(update);
             return 0;
         }
 
@@ -779,6 +814,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             break;
 
         case WM_DESTROY:
+            StopTrayRegistration();
             KillTimer(hwnd, ID_TIMER_AUTO_UPDATE);
             KillTimer(hwnd, ID_TIMER_UPDATE_PROGRESS);
             LogMessage("Window destroyed.");
@@ -791,6 +827,83 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     return 0;
 }
 
+/* All registration state belongs to the window thread. Keep the latest icon
+ * and tooltip even while Explorer is absent; retry only until it accepts them. */
+static void PublishTrayIcon(void) {
+    if (!g_trayActive || !nid.hWnd) return;
+    NOTIFYICONDATAA data = nid;
+    /* Tooltip/icon-only updates must never turn a later ADD into a partial one. */
+    data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    BOOL wasRegistered = g_trayRegistered;
+    DWORD command = wasRegistered ? NIM_MODIFY : NIM_ADD;
+    BOOL accepted = Shell_NotifyIconA(command, &data);
+    /* A rebuilt taskbar can either retain or discard our old identity. */
+    if (!accepted) {
+        accepted = Shell_NotifyIconA(wasRegistered ? NIM_ADD : NIM_MODIFY, &data);
+    }
+    g_trayRegistered = accepted;
+    if (accepted) {
+        if (!wasRegistered) LogMessage("Tray icon registered");
+        KillTimer(nid.hWnd, ID_TIMER_TRAY_RETRY);
+        g_trayRetryPending = FALSE;
+    } else if (!g_trayRetryPending) {
+        LogMessage("Tray registration failed; retrying when Explorer is ready");
+        g_trayRetryPending = SetTimer(nid.hWnd, ID_TIMER_TRAY_RETRY,
+                                      TRAY_RETRY_MS, NULL) != 0;
+        if (!g_trayRetryPending) LogMessage("Could not start tray registration retry timer");
+    }
+}
+
+static void StopTrayRegistration(void) {
+    BOOL wasActive = g_trayActive;
+    /* KillTimer does not remove an already queued WM_TIMER. */
+    g_trayActive = FALSE;
+    g_trayRegistered = FALSE;
+    g_trayRetryPending = FALSE;
+    if (nid.hWnd) {
+        KillTimer(nid.hWnd, ID_TIMER_TRAY_RETRY);
+        if (wasActive) Shell_NotifyIconA(NIM_DELETE, &nid);
+    }
+}
+
+static void RegisterTaskbarMessage(HWND hwnd) {
+    g_WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
+    /* An elevated app must also receive the unelevated shell's broadcast.
+     * Resolve dynamically for SDKs targeting Windows Vista. */
+    typedef BOOL (WINAPI *FilterFn)(HWND, UINT, DWORD, void*);
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    FilterFn allow = user32 ? (FilterFn)(void*)GetProcAddress(user32, "ChangeWindowMessageFilterEx") : NULL;
+    if (g_WM_TASKBARCREATED && allow) allow(hwnd, g_WM_TASKBARCREATED, 1 /* MSGFLT_ALLOW */, NULL);
+}
+
+/* Worker threads post owned snapshots. Only this window thread mutates nid or
+ * registration/timer state, including while an Explorer recovery is pending. */
+static void ApplyTrayUpdate(const TrayUpdate* update) {
+    if (!g_trayActive) return;
+    if (update->flags & NIF_ICON) nid.hIcon = update->icon;
+    if (update->flags & NIF_TIP) {
+        memcpy(nid.szTip, update->tip, sizeof(nid.szTip));
+    }
+    PublishTrayIcon();
+}
+
+static void QueueTrayUpdate(UINT flags, HICON icon, const char* tip) {
+    TrayUpdate update = {0};
+    update.flags = flags;
+    update.icon = icon;
+    if (tip) {
+        strncpy(update.tip, tip, sizeof(update.tip) - 1);
+    }
+    if (GetCurrentThreadId() == GetWindowThreadProcessId(g_hwnd, NULL)) {
+        ApplyTrayUpdate(&update);
+        return;
+    }
+    TrayUpdate* pending = malloc(sizeof(*pending));
+    if (!pending) return;
+    *pending = update;
+    if (!PostMessage(g_hwnd, WM_APP_TRAY_UPDATE, 0, (LPARAM)pending)) free(pending);
+}
+
 void InitTrayIcon(HWND hwnd) {
     nid.cbSize = sizeof(NOTIFYICONDATA);
     nid.hWnd = hwnd;
@@ -799,8 +912,8 @@ void InitTrayIcon(HWND hwnd) {
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = hIconEmpty;
     strcpy(nid.szTip, "API Monitor - Initializing...");
-    Shell_NotifyIconA(NIM_ADD, &nid);
-    LogMessage("Tray icon added to system tray.");
+    g_trayActive = TRUE;
+    PublishTrayIcon();
 }
 
 void CreateContextMenu() {
@@ -1582,9 +1695,7 @@ DWORD WINAPI RefreshThread(LPVOID param) {
         // Update tooltip with attempt count
         char tip[128];
         snprintf(tip, sizeof(tip), "Updating API contents [%d/%d]...", attempt, maxAttempts);
-        strcpy(nid.szTip, tip);
-        nid.uFlags = NIF_TIP;
-        Shell_NotifyIconA(NIM_MODIFY, &nid);
+        QueueTrayUpdate(NIF_TIP, NULL, tip);
 
         LogMessage("API refresh attempt %d/%d started.", attempt, maxAttempts);
 
@@ -1867,10 +1978,7 @@ void UpdateTooltip() {
                  diff, serverTime);
     }
 
-    strncpy(nid.szTip, tooltip, sizeof(nid.szTip) - 1);
-    nid.szTip[sizeof(nid.szTip) - 1] = '\0';
-    nid.uFlags = NIF_TIP;
-    Shell_NotifyIconA(NIM_MODIFY, &nid);
+    QueueTrayUpdate(NIF_TIP, NULL, tooltip);
 }
 
 void SetIcon(HICON icon) {
@@ -1884,9 +1992,7 @@ void SetIcon(HICON icon) {
 
     currentIcon = icon;
     iconVisible = TRUE;
-    nid.hIcon = icon;
-    nid.uFlags = NIF_ICON;
-    Shell_NotifyIconA(NIM_MODIFY, &nid);
+    QueueTrayUpdate(NIF_ICON, icon, NULL);
 }
 
 void CALLBACK TooltipTimer(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime) {
@@ -1952,20 +2058,9 @@ BOOL HasDisplaySettingsChanged() {
 
 void RefreshTrayIconForNewResolution() {
     LogMessage("Refreshing tray icon for new resolution/DPI.");
-
-    HICON savedIcon = currentIcon;
-
-    Shell_NotifyIconA(NIM_DELETE, &nid);
-    Sleep(10);
-
-    nid.cbSize = sizeof(NOTIFYICONDATA);
-    nid.hWnd = g_hwnd;
-    nid.uID = 1;
-    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-    nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = savedIcon;
-    Shell_NotifyIconA(NIM_ADD, &nid);
-
+    /* Preserve the latest artwork and tooltip; publish can add or modify
+     * depending on whether Explorer kept the existing registration. */
+    PublishTrayIcon();
     UpdateTooltip();
 }
 
@@ -4316,6 +4411,7 @@ void ExitApplication(HWND hwnd) {
     static BOOL alreadyExiting = FALSE;
     if (alreadyExiting) return;
     alreadyExiting = TRUE;
+    StopTrayRegistration();
 
     LogMessage("=== Application shutting down ===");
 
@@ -4336,8 +4432,6 @@ void ExitApplication(HWND hwnd) {
 
     SaveHistoryToRegistry();
     FreeHistoryBuffer();
-
-    Shell_NotifyIconA(NIM_DELETE, &nid);
 
     if (hIconEmpty) DestroyIcon(hIconEmpty);
     if (hIconSuccess) DestroyIcon(hIconSuccess);

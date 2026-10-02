@@ -5,6 +5,7 @@ A Windows system tray application that monitors an API endpoint and displays its
 ## Features
 
 - System tray icon that reflects API status (success, fail, error)
+- Tray icon registration retries while Explorer is starting and recovers automatically after an Explorer restart, preserving the current icon and tooltip; retries stop as soon as registration succeeds
 - Configurable API URL with live validation, healthy/down check intervals, logging toggle, and history limit
 - Modern WebView2-based configuration and history dialogs (React + Tailwind CSS)
 - Configuration and history windows size themselves to their content, cannot be resized, and have only a Close button
@@ -166,6 +167,13 @@ never saved as a preference, and is discarded on cancellation or failure.
 └── release/
     └── APIMonitor.exe        # Built executable
 ```
+
+## Tray recovery checks
+
+Tray startup/recovery regression checks: `python3 tests/test_tray_registration.py`.
+These simulate delayed Explorer readiness, taskbar recreation, current icon/tooltip
+recovery, and shutdown with a retry already queued; a live sign-in/restart smoke
+test requires Windows.
 
 ## License
 
