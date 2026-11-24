@@ -1,6 +1,7 @@
 """Run the production tray lifecycle against a controllable shell on Linux."""
 from pathlib import Path
 import re
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -59,14 +60,27 @@ static NOTIFYICONDATAW cache, published;
 #define g_nid cache
 #define nid cache
 static BOOL g_trayActive, g_trayRegistered, g_trayRetryPending;
+static BOOL g_trayBlinking, g_trayBlinkHidden;
+static void* hIconEmpty = (void*)1001;
+static void* hIconFail = (void*)1002;
+static void* hIconSuccess = (void*)1003;
+static void* hIconBlank = (void*)1004;
 static UINT g_WM_TASKBARCREATED = 0xc001;
-static int ready, held, timer, failTimer, arms, calls, deletes;
+static int ready, held, timer, failTimer, arms, calls, deletes, blinkTimer, blinkArms;
+static int iconOnly; /* Expect (and count) blink ticks, which never resend the tooltip. */
 static DWORD commands[4096];
 static BOOL Notify(DWORD command, NOTIFYICONDATAW* data) {
     assert(calls < 4096);
     commands[calls++] = command;
     assert(data->hWnd == (HWND)1 && data->uID == 17);
     if (command == NIM_DELETE) { held = 0; deletes++; return TRUE; }
+    if (data->uFlags == NIF_ICON) {
+        assert(command == NIM_MODIFY && g_trayBlinking); /* Never a partial ADD. */
+        iconOnly++;
+        if (!ready || !held) return FALSE;
+        published.hIcon = data->hIcon;
+        return TRUE;
+    }
     assert(data->uFlags == (NIF_ICON | NIF_MESSAGE | NIF_TIP));
     assert(data->uCallbackMessage == 0x8001);
     if (!ready || (command == NIM_ADD && held) || (command == NIM_MODIFY && !held)) return FALSE;
@@ -77,17 +91,29 @@ static BOOL Notify(DWORD command, NOTIFYICONDATAW* data) {
 #define Shell_NotifyIconW Notify
 #define Shell_NotifyIconA Notify
 static UINT SetTimer(HWND window, UINT id, UINT delay, void* callback) {
-    assert(window == (HWND)1 && id == ID_TIMER_TRAY_RETRY);
-    assert(delay == 2000 && callback == NULL);
+    assert(window == (HWND)1 && callback == NULL);
+    if (id == ID_TIMER_TRAY_BLINK) {
+        assert(delay == TRAY_BLINK_MS);
+        if (failTimer) return 0;
+        blinkArms++;
+        blinkTimer = 1;
+        return id;
+    }
+    assert(id == ID_TIMER_TRAY_RETRY && delay == 2000);
     arms++;
     if (failTimer) return 0;
     timer = 1;
     return id;
 }
 static void KillTimer(HWND window, UINT id) {
-    assert(window == (HWND)1 && id == ID_TIMER_TRAY_RETRY);
+    assert(window == (HWND)1);
+    if (id == ID_TIMER_TRAY_BLINK) { blinkTimer = 0; return; }
+    assert(id == ID_TIMER_TRAY_RETRY);
     timer = 0;
 }
+/* A check reporting its icon, as ApplyTrayUpdate does on the window thread. */
+static void Report(void* icon);
+#define TICK() TrayMessages(WM_TIMER, ID_TIMER_TRAY_BLINK)
 '''
         assertions = r'''
 int main(void) {
@@ -153,13 +179,119 @@ int main(void) {
     TrayMessages(WM_TIMER, ID_TIMER_TRAY_RETRY);
     assert(g_trayRegistered && !timer);
     StopTrayRegistration();
+
+    /* --- Blinking --- */
+    calls = 0; held = 0; deletes = 0; failTimer = 0; ready = 1;
+    cache.hIcon = hIconSuccess;
+    g_trayActive = TRUE;
+    RestartTrayBlink();
+    PublishTrayIcon();
+    assert(!g_trayBlinking && !blinkTimer && published.hIcon == hIconSuccess);
+    before = calls;
+    for (int i = 0; i < 10; i++) TICK();
+    assert(calls == before); /* Healthy: solid, no extra shell traffic. */
+
+    void* blinkers[] = { hIconEmpty, hIconFail };
+    for (int i = 0; i < 2; i++) {
+        void* icon = blinkers[i];
+        Report(icon);
+        assert(g_trayBlinking && blinkTimer && published.hIcon == icon); /* Visible at once. */
+        int armed = blinkArms;
+        iconOnly = 0;
+        for (int n = 0; n < 20; n++) {
+            TICK();
+            assert(published.hIcon == (n % 2 ? icon : hIconBlank));
+            assert(cache.hIcon == icon); /* The status itself is never lost. */
+        }
+        assert(iconOnly == 20 && deletes == 0);
+        TICK();
+        assert(published.hIcon == hIconBlank);
+        Report(icon); /* The next failing check must not disturb the rhythm... */
+        assert(blinkArms == armed && published.hIcon == hIconBlank);
+        PublishTrayIcon(); /* ...and neither must a tooltip update. */
+        assert(published.hIcon == hIconBlank);
+        TICK();
+        assert(published.hIcon == icon);
+        TICK();
+        assert(published.hIcon == hIconBlank); /* Leave it hidden for the next change. */
+    }
+
+    /* Straight from one blinking status to the other: shown at once, timer restarted. */
+    before = blinkArms;
+    Report(hIconEmpty);
+    assert(published.hIcon == hIconEmpty && blinkArms == before + 1 && blinkTimer);
+
+    /* Recovery during the hidden half stops on a solid icon; a queued tick is ignored. */
+    TICK();
+    assert(published.hIcon == hIconBlank);
+    Report(hIconSuccess);
+    assert(!g_trayBlinking && !blinkTimer && published.hIcon == hIconSuccess);
+    before = calls;
+    TICK();
+    assert(calls == before && published.hIcon == hIconSuccess);
+
+    /* While Explorer is away only the retry timer calls the shell, and the icon is
+     * visible when it comes back. */
+    Report(hIconFail);
+    ready = 0; held = 0;
+    TrayMessages(g_WM_TASKBARCREATED, 0);
+    assert(timer && !g_trayRegistered);
+    before = calls;
+    for (int i = 0; i < 7; i++) TICK();
+    assert(calls == before && !g_trayBlinkHidden);
+    ready = 1;
+    TrayMessages(WM_TIMER, ID_TIMER_TRAY_RETRY);
+    assert(held && g_trayRegistered && published.hIcon == hIconFail);
+    TICK();
+    assert(published.hIcon == hIconBlank);
+
+    /* A blink tick that finds the icon gone restores the full registration. */
+    held = 0;
+    memset(&published, 0, sizeof(published));
+    TICK();
+    assert(held && g_trayRegistered && !timer && published.hIcon == hIconFail);
+    assert(published.uFlags == (NIF_ICON | NIF_MESSAGE | NIF_TIP));
+    assert(wcscmp(published.szTip, L"latest status") == 0);
+    ready = 0; held = 0;
+    TICK();
+    assert(timer && !g_trayRegistered && g_trayRetryPending); /* Or hands over to the retry. */
+    ready = 1;
+    TrayMessages(WM_TIMER, ID_TIMER_TRAY_RETRY);
+    assert(held && !timer);
+
+    /* Without a timer the icon simply stays solid. */
+    Report(hIconSuccess);
+    failTimer = 1;
+    Report(hIconEmpty);
+    assert(!g_trayBlinking && published.hIcon == hIconEmpty);
+    TICK();
+    assert(published.hIcon == hIconEmpty);
+    failTimer = 0;
+
+    /* Shutdown: no tick may use the icon handles once they are about to be destroyed. */
+    Report(hIconFail);
+    TICK();
+    StopTrayRegistration();
+    before = calls;
+    TICK();
+    BlinkTrayIcon();
+    assert(calls == before && !blinkTimer && !g_trayBlinking && !g_trayBlinkHidden && !held);
     puts("tray lifecycle passed");
     return 0;
 }
 '''
-        defines = "\n".join(re.findall(r"^#define (?:ID_TIMER_TRAY_RETRY|TRAY_RETRY_MS) .+$", SOURCE, re.M))
-        harness = defines + "\n" + stubs + function("PublishTrayIcon") + "\n" + function("StopTrayRegistration")
+        defines = "\n".join(re.findall(r"^#define (?:ID_TIMER_TRAY_RETRY|TRAY_RETRY_MS|ID_TIMER_TRAY_BLINK|TRAY_BLINK_MS) .+$", SOURCE, re.M))
+        harness = defines + "\n" + stubs + "\n".join(map(function, (
+            "PublishTrayIcon", "RestartTrayBlink", "BlinkTrayIcon", "StopTrayRegistration")))
         harness += "\nstatic LRESULT TrayMessages(UINT msg, WPARAM wParam) {" + messages + "return -1;\n}\n"
+        apply = re.sub(r"memcpy\(nid.szTip[^;]*;", "", function("ApplyTrayUpdate"))
+        harness += "typedef struct { UINT flags; void* icon; } TrayUpdate;\n" + apply
+        harness += """
+static void Report(void* icon) {
+    TrayUpdate update = { NIF_ICON, icon };
+    ApplyTrayUpdate(&update);
+}
+"""
         harness += assertions
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "tray.c"
@@ -185,7 +317,9 @@ static struct { HICON hIcon; char szTip[128]; } nid;
 static int g_trayActive = 1, publishes, thread = 2, postSucceeds = 1, outstanding;
 static void* g_hwnd = (void*)1;
 static TrayUpdate* queued;
+static int restarts;
 static void PublishTrayIcon(void) { assert(thread == 1); publishes++; }
+static void RestartTrayBlink(void) { assert(thread == 1); restarts++; }
 static UINT GetCurrentThreadId(void) { return thread; }
 static UINT GetWindowThreadProcessId(void* hwnd, void* pid) { assert(hwnd == g_hwnd && !pid); return 1; }
 static int PostMessage(void* hwnd, UINT msg, uintptr_t wp, LPARAM lp) {
@@ -210,7 +344,10 @@ int main(void) {
     ApplyTrayUpdate(queued); free(queued); queued = NULL;
     assert(publishes == 1 && strcmp(nid.szTip, "worker status") == 0 && outstanding == 0);
     QueueTrayUpdate(NIF_ICON, (HICON)23, NULL);
-    assert(!queued && publishes == 2 && nid.hIcon == (HICON)23);
+    assert(!queued && publishes == 2 && nid.hIcon == (HICON)23 && restarts == 1);
+    QueueTrayUpdate(NIF_ICON, (HICON)23, NULL);
+    assert(publishes == 3 && restarts == 1); /* Same icon again: no new rhythm. */
+    publishes = 2;
     assert(strcmp(nid.szTip, "worker status") == 0);
     thread = 2;
     QueueTrayUpdate(NIF_ICON | NIF_TIP, (HICON)24, "newer");
@@ -246,10 +383,29 @@ int main(void) {
         create = function("InitTrayIcon")
         self.assertIn("g_trayActive = TRUE;", create)
         self.assertIn("PublishTrayIcon();", create)
+        self.assertLess(create.index("nid.hIcon = "), create.index("RestartTrayBlink();"))
+        self.assertLess(create.index("RestartTrayBlink();"), create.index("PublishTrayIcon();"))
         proc = function(PROC)
         self.assertRegex(proc, r"case WM_DESTROY:\s+StopTrayRegistration\(\);")
         ids = re.findall(r"^#define ID_TIMER_\w+\s+(\d+)\s*$", SOURCE, re.M)
         self.assertEqual(len(ids), len(set(ids)), "Retry timer must not collide with another timer")
+
+    def test_icon_artwork(self):
+        icons = {name: (ROOT / "assets" / (name + ".ico")).read_bytes()
+                 for name in ("empty", "fail", "blank")}
+        for name, data in icons.items():
+            reserved, kind, count = struct.unpack("<HHH", data[:6])
+            width, height, _, _, _, bpp, size, offset = struct.unpack("<BBBBHHII", data[6:22])
+            self.assertEqual((reserved, kind, count, width, height, bpp, size + offset),
+                             (0, 1, 1, 16, 16, 32, len(data)), name)
+        # Hidden means transparent however it is drawn: by alpha, or by mask when a
+        # reader treats the near-empty alpha channel as absent.
+        blank = icons["blank"][22:]
+        self.assertEqual(struct.unpack("<IiiHHI", blank[:20]), (40, 16, 32, 1, 32, 0))
+        pixels, mask = blank[40:40 + 16 * 16 * 4], blank[40 + 16 * 16 * 4:]
+        self.assertEqual([p for p in pixels if p], [1])
+        self.assertEqual(pixels.index(1) % 4, 3)
+        self.assertEqual(mask, b"\xff\xff\x00\x00" * 16)
 
 
 if __name__ == "__main__":

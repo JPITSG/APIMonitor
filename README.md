@@ -56,10 +56,12 @@ Or using the short tag:
 
 | State | Icon | Refresh Interval |
 |-------|------|------------------|
-| Success | Green | Configured healthy interval (default 60s) |
-| Fail | Red | Configured down interval (default 10s) |
-| Error (network/HTTP) | Empty | Configured down interval (default 10s) |
-| Invalid (bad XML) | Empty | Configured down interval (default 10s) |
+| Success | Green check mark | Configured healthy interval (default 60s) |
+| Fail | Red cross, blinking | Configured down interval (default 10s) |
+| Error (network/HTTP) | Red question mark, blinking | Configured down interval (default 10s) |
+| Invalid (bad XML) | Red question mark, blinking | Configured down interval (default 10s) |
+
+The question mark is also shown from startup until the first check finishes.
 
 Each interval starts after the preceding API check, including its retry cycle,
 has fully completed. A new scheduled or manual check cannot overlap one already

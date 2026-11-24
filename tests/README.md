@@ -28,3 +28,8 @@ as above. It checks all editable settings, reverting edits, native and footer
 close requests, save/discard/keep editing, Escape and Tab, empty URL handling,
 and update notices arriving while the save prompt is open. The screenshot is
 written to `/tmp/apimonitor-unsaved-changes.png`.
+
+Run `python3 tests/test_tray_registration.py` for the tray icon. It compiles the
+production registration, retry, and blink handling against a controllable shell:
+Explorer missing or restarting, the question mark and cross blinking without
+resending the tooltip, the healthy icon staying solid, and shutdown.

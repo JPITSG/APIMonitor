@@ -33,6 +33,8 @@
 
 #define ID_TIMER_TRAY_RETRY 1009
 #define TRAY_RETRY_MS 2000
+#define ID_TIMER_TRAY_BLINK 1010
+#define TRAY_BLINK_MS 500
 
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_EXIT 1001
@@ -110,7 +112,11 @@ static UINT g_WM_TASKBARCREATED = 0;
 static BOOL g_trayActive = FALSE;
 static BOOL g_trayRegistered = FALSE;
 static BOOL g_trayRetryPending = FALSE;
+static BOOL g_trayBlinking = FALSE;     // The current status icon is one that blinks
+static BOOL g_trayBlinkHidden = FALSE;  // ...and is in its hidden half-cycle
 static void PublishTrayIcon(void);
+static void RestartTrayBlink(void);
+static void BlinkTrayIcon(void);
 static void StopTrayRegistration(void);
 static void RegisterTaskbarMessage(HWND hwnd);
 typedef struct {
@@ -131,7 +137,6 @@ static HICON hIconFail = NULL;
 static HICON hIconBlank = NULL;
 static UINT_PTR timerRefresh = 0;
 static UINT_PTR timerTooltip = 0;
-static BOOL iconVisible = TRUE;
 static HICON currentIcon = NULL;
 static char currentMessage[256] = "";
 static ApiResult currentResult = RESULT_NONE;
@@ -719,6 +724,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         if (g_trayRetryPending) PublishTrayIcon();
         return 0;
     }
+    if (uMsg == WM_TIMER && wParam == ID_TIMER_TRAY_BLINK) {
+        if (g_trayBlinking) BlinkTrayIcon();
+        return 0;
+    }
     switch (uMsg) {
         case WM_APP_UPDATE_RESULT: {
             UpdateCheckTask* task = (UpdateCheckTask*)InterlockedExchangePointer(
@@ -834,6 +843,7 @@ static void PublishTrayIcon(void) {
     NOTIFYICONDATAA data = nid;
     /* Tooltip/icon-only updates must never turn a later ADD into a partial one. */
     data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    if (g_trayBlinkHidden) data.hIcon = hIconBlank;
     BOOL wasRegistered = g_trayRegistered;
     DWORD command = wasRegistered ? NIM_MODIFY : NIM_ADD;
     BOOL accepted = Shell_NotifyIconA(command, &data);
@@ -854,14 +864,43 @@ static void PublishTrayIcon(void) {
     }
 }
 
+/* The question mark and the cross blink for as long as either one is shown.
+ * nid.hIcon always stays the real status icon; only what is published changes.
+ * A new status is always visible straight away. */
+static void RestartTrayBlink(void) {
+    g_trayBlinkHidden = FALSE;
+    g_trayBlinking = FALSE;
+    if (nid.hIcon == hIconEmpty || nid.hIcon == hIconFail) {
+        g_trayBlinking = SetTimer(nid.hWnd, ID_TIMER_TRAY_BLINK,
+                                  TRAY_BLINK_MS, NULL) != 0;
+        if (!g_trayBlinking) LogMessage("Could not start tray blink timer");
+    } else {
+        KillTimer(nid.hWnd, ID_TIMER_TRAY_BLINK);
+    }
+}
+
+static void BlinkTrayIcon(void) {
+    /* Only the retry timer may try to register a missing icon. */
+    if (!g_trayActive || !g_trayRegistered) return;
+    g_trayBlinkHidden = !g_trayBlinkHidden;
+    NOTIFYICONDATAA data = nid;
+    /* Resending the tooltip this often could disturb one that is being read. */
+    data.uFlags = NIF_ICON;
+    if (g_trayBlinkHidden) data.hIcon = hIconBlank;
+    if (!Shell_NotifyIconA(NIM_MODIFY, &data)) PublishTrayIcon();
+}
+
 static void StopTrayRegistration(void) {
     BOOL wasActive = g_trayActive;
     /* KillTimer does not remove an already queued WM_TIMER. */
     g_trayActive = FALSE;
     g_trayRegistered = FALSE;
     g_trayRetryPending = FALSE;
+    g_trayBlinking = FALSE;
+    g_trayBlinkHidden = FALSE;
     if (nid.hWnd) {
         KillTimer(nid.hWnd, ID_TIMER_TRAY_RETRY);
+        KillTimer(nid.hWnd, ID_TIMER_TRAY_BLINK);
         if (wasActive) Shell_NotifyIconA(NIM_DELETE, &nid);
     }
 }
@@ -880,7 +919,11 @@ static void RegisterTaskbarMessage(HWND hwnd) {
  * registration/timer state, including while an Explorer recovery is pending. */
 static void ApplyTrayUpdate(const TrayUpdate* update) {
     if (!g_trayActive) return;
-    if (update->flags & NIF_ICON) nid.hIcon = update->icon;
+    /* Every check reports its icon again; only a change restarts the rhythm. */
+    if ((update->flags & NIF_ICON) && update->icon != nid.hIcon) {
+        nid.hIcon = update->icon;
+        RestartTrayBlink();
+    }
     if (update->flags & NIF_TIP) {
         memcpy(nid.szTip, update->tip, sizeof(nid.szTip));
     }
@@ -913,6 +956,7 @@ void InitTrayIcon(HWND hwnd) {
     nid.hIcon = hIconEmpty;
     strcpy(nid.szTip, "API Monitor - Initializing...");
     g_trayActive = TRUE;
+    RestartTrayBlink();
     PublishTrayIcon();
 }
 
@@ -1991,7 +2035,6 @@ void SetIcon(HICON icon) {
     LogMessage("SetIcon called: icon=%s", iconName);
 
     currentIcon = icon;
-    iconVisible = TRUE;
     QueueTrayUpdate(NIF_ICON, icon, NULL);
 }
 
