@@ -62,7 +62,8 @@ Or using the short tag:
 | Invalid (bad XML) | Red question mark, blinking | Configured down interval (default 10s) |
 
 The question mark is also shown from startup until the first check finishes.
-After 10 minutes without returning to green, the blinking becomes twice as fast.
+After 10 minutes without returning to green, the blinking becomes twice as fast;
+**Blink Faster When Still Down** changes that time or turns it off.
 
 Each interval starts after the preceding API check, including its retry cycle,
 has fully completed. A new scheduled or manual check cannot overlap one already
@@ -102,6 +103,7 @@ This applies to Cancel, Escape, the window's Close button, and Alt+F4.
 | API URL | `ApiUrl` | REG_SZ | `http://example.com/api/status` |
 | Everything OK Interval | `RefreshInterval` | REG_DWORD | `60` (seconds) |
 | Something Down Interval | `DownRefreshInterval` | REG_DWORD | `10` (seconds) |
+| Blink Faster When Still Down | `FastBlinkMinutes` | REG_DWORD | `10` (minutes; `0` = never) |
 | Enable Logging | `LoggingEnabled` | REG_DWORD | `1` |
 | History Limit | `HistoryLimit` | REG_DWORD | `100` (10–10,000) |
 | Start with Windows | `APIMonitor` (see below) | REG_SZ | Off |

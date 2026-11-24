@@ -14,7 +14,7 @@ const puppeteer = require('puppeteer');
     page.on('pageerror', error => errors.push(error.message));
     const config = {
       url: 'https://example.com/status', healthyInterval: 60, downInterval: 10,
-      loggingEnabled: false, historyLimit: 100, startWithWindows: false,
+      fastBlinkMinutes: 10, loggingEnabled: false, historyLimit: 100, startWithWindows: false,
       autoCheckForUpdates: false, updateCheckPending: false, updatePromptPending: false,
     };
     await page.evaluateOnNewDocument(() => {
@@ -67,6 +67,7 @@ const puppeteer = require('puppeteer');
       [() => changeText('#api-url', 'https://example.com/changed'), () => changeText('#api-url', config.url)],
       [() => page.select('#healthy-interval', '120'), () => page.select('#healthy-interval', '60')],
       [() => page.select('#down-interval', '30'), () => page.select('#down-interval', '10')],
+      [() => page.select('#fast-blink', '0'), () => page.select('#fast-blink', '10')],
       [() => page.click('#logging'), () => page.click('#logging')],
       [() => changeText('#history-limit', '200'), () => changeText('#history-limit', '100')],
       [() => page.click('#start-with-windows'), () => page.click('#start-with-windows')],
@@ -126,6 +127,33 @@ const puppeteer = require('puppeteer');
       const {updateCheckPending, updatePromptPending, ...expected} = config;
       assert.deepEqual(await actions(), [{action: 'saveSettings', ...expected,
         startWithWindows: true, historyLimit: 250}]);
+    }
+
+    // Faster blinking: every choice, including Never (0), is saved as a number...
+    const choices = await page.$$eval('#fast-blink option', options => options.map(o => [o.value, o.textContent]));
+    assert.deepEqual(choices, [
+      ['1', 'After 1 minute'], ['2', 'After 2 minutes'], ['5', 'After 5 minutes'],
+      ['10', 'After 10 minutes'], ['15', 'After 15 minutes'], ['30', 'After 30 minutes'],
+      ['60', 'After 1 hour'], ['0', 'Never'],
+    ]);
+    for (const [value] of choices) {
+      await reset();
+      assert.equal(await page.$eval('#fast-blink', el => el.value), '10');
+      await page.select('#fast-blink', value);
+      await click('Save');
+      await page.waitForFunction(() => window.messages.some(m => m.action === 'saveSettings'));
+      assert.strictEqual((await actions())[0].fastBlinkMinutes, Number(value));
+    }
+    // ...a stored one is shown and is not itself an edit, and 10 minutes is the default.
+    for (const [stored, shown] of [[0, 'Never'], [60, 'After 1 hour'], [undefined, 'After 10 minutes']]) {
+      const original = config.fastBlinkMinutes;
+      config.fastBlinkMinutes = stored;
+      await reset();
+      config.fastBlinkMinutes = original;
+      assert.equal(await page.$eval('#fast-blink', el => el.selectedOptions[0].textContent), shown);
+      await nativeClose();
+      await page.waitForFunction(() => window.messages.some(m => m.action === 'close'));
+      await noPrompt();
     }
 
     // Empty URL cannot silently lose edits on Save.

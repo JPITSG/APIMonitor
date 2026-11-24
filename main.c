@@ -36,7 +36,7 @@
 #define ID_TIMER_TRAY_BLINK 1010
 #define TRAY_BLINK_MS 500
 #define TRAY_BLINK_FAST_MS 250
-#define TRAY_BLINK_FAST_AFTER ((10u * 60u * 1000u) / TRAY_BLINK_MS)  // Ticks in 10 minutes
+#define FAST_BLINK_DEFAULT_MINUTES 10
 
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_EXIT 1001
@@ -49,6 +49,7 @@
 #define REG_VALUE_URL       "ApiUrl"
 #define REG_VALUE_INTERVAL  "RefreshInterval"
 #define REG_VALUE_DOWN_INTERVAL "DownRefreshInterval"
+#define REG_VALUE_FAST_BLINK "FastBlinkMinutes"
 #define REG_VALUE_LOGGING   "LoggingEnabled"
 #define REG_VALUE_CONFIGURED "Configured"
 #define REG_VALUE_HISTORY_LIMIT "HistoryLimit"
@@ -114,11 +115,12 @@ static UINT g_WM_TASKBARCREATED = 0;
 static BOOL g_trayActive = FALSE;
 static BOOL g_trayRegistered = FALSE;
 static BOOL g_trayRetryPending = FALSE;
-static BOOL g_trayBlinking = FALSE;     // The current status icon is one that blinks
-static BOOL g_trayBlinkHidden = FALSE;  // ...and is in its hidden half-cycle
-static UINT g_trayBlinkTicks = 0;       // Blink ticks since the last healthy status
+static UINT g_trayBlinkInterval = 0;    // Of the running blink timer; 0 while solid
+static BOOL g_trayBlinkHidden = FALSE;  // In the hidden half of a blink
+static ULONGLONG g_trayBlinkMs = 0;     // Time spent blinking since the last healthy status
 static void PublishTrayIcon(void);
 static void RestartTrayBlink(void);
+static void UpdateTrayBlinkRate(void);
 static void BlinkTrayIcon(void);
 static void StopTrayRegistration(void);
 static void RegisterTaskbarMessage(HWND hwnd);
@@ -133,6 +135,7 @@ static HMENU hMenu = NULL;
 static char configApiUrl[512] = "http://example.com/api/status";
 static int configRefreshInterval = 60;
 static int configDownRefreshInterval = 10;
+static int configFastBlinkMinutes = FAST_BLINK_DEFAULT_MINUTES;  // 0 = never blink faster
 static char logFilePath[MAX_PATH];
 static HICON hIconEmpty = NULL;
 static HICON hIconSuccess = NULL;
@@ -617,8 +620,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         LogMessage("Migrated configuration from INI to registry.");
     }
 
-    LogMessage("Configuration loaded: URL=%s, HealthyInterval=%d, DownInterval=%d, Logging=%s, HistoryLimit=%d",
+    LogMessage("Configuration loaded: URL=%s, HealthyInterval=%d, DownInterval=%d, FastBlinkMinutes=%d, Logging=%s, HistoryLimit=%d",
                configApiUrl, configRefreshInterval, configDownRefreshInterval,
+               configFastBlinkMinutes,
                configLoggingEnabled ? "enabled" : "disabled", configHistoryLimit);
 
     // Initialize history buffer
@@ -728,7 +732,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
     if (uMsg == WM_TIMER && wParam == ID_TIMER_TRAY_BLINK) {
-        if (g_trayBlinking) BlinkTrayIcon();
+        if (g_trayBlinkInterval) BlinkTrayIcon();
         return 0;
     }
     switch (uMsg) {
@@ -867,22 +871,45 @@ static void PublishTrayIcon(void) {
     }
 }
 
+static UINT TrayBlinkIntervalDue(void) {
+    BOOL fast = configFastBlinkMinutes > 0 &&
+        g_trayBlinkMs >= (ULONGLONG)configFastBlinkMinutes * 60u * 1000u;
+    return fast ? TRAY_BLINK_FAST_MS : TRAY_BLINK_MS;
+}
+
+/* A timer that cannot be set leaves a running one as it is. */
+static void StartTrayBlinkTimer(void) {
+    UINT interval = TrayBlinkIntervalDue();
+    if (SetTimer(nid.hWnd, ID_TIMER_TRAY_BLINK, interval, NULL)) {
+        if (interval == TRAY_BLINK_FAST_MS && g_trayBlinkInterval != interval) {
+            LogMessage("Tray icon has been blinking for %d minutes or more; blinking faster",
+                       configFastBlinkMinutes);
+        }
+        g_trayBlinkInterval = interval;
+    } else if (!g_trayBlinkInterval) {
+        LogMessage("Could not start tray blink timer");
+    }
+}
+
+/* Only a changed rate touches the timer, so the rhythm is not disturbed. */
+static void UpdateTrayBlinkRate(void) {
+    if (g_trayBlinkInterval && g_trayBlinkInterval != TrayBlinkIntervalDue()) {
+        StartTrayBlinkTimer();
+    }
+}
+
 /* The question mark and the cross blink for as long as either one is shown, and
- * faster once that has gone on for 10 minutes. Changing from one to the other
- * keeps counting; only a healthy status starts over.
+ * faster once that has gone on for the configured time. Changing from one to the
+ * other keeps counting; only a healthy status starts over.
  * nid.hIcon always stays the real status icon; only what is published changes.
  * A new status is always visible straight away. */
 static void RestartTrayBlink(void) {
     g_trayBlinkHidden = FALSE;
-    g_trayBlinking = FALSE;
     if (nid.hIcon == hIconEmpty || nid.hIcon == hIconFail) {
-        UINT interval = g_trayBlinkTicks < TRAY_BLINK_FAST_AFTER
-            ? TRAY_BLINK_MS : TRAY_BLINK_FAST_MS;
-        g_trayBlinking = SetTimer(nid.hWnd, ID_TIMER_TRAY_BLINK,
-                                  interval, NULL) != 0;
-        if (!g_trayBlinking) LogMessage("Could not start tray blink timer");
+        StartTrayBlinkTimer();
     } else {
-        g_trayBlinkTicks = 0;
+        g_trayBlinkInterval = 0;
+        g_trayBlinkMs = 0;
         KillTimer(nid.hWnd, ID_TIMER_TRAY_BLINK);
     }
 }
@@ -891,12 +918,9 @@ static void BlinkTrayIcon(void) {
     /* Only the retry timer may try to register a missing icon. */
     if (!g_trayActive || !g_trayRegistered) return;
     g_trayBlinkHidden = !g_trayBlinkHidden;
-    /* Counted, not timed, so that sleep does not pass for blinking. */
-    if (g_trayBlinkTicks < TRAY_BLINK_FAST_AFTER &&
-        ++g_trayBlinkTicks == TRAY_BLINK_FAST_AFTER) {
-        LogMessage("Tray icon has been blinking for 10 minutes; blinking faster");
-        SetTimer(nid.hWnd, ID_TIMER_TRAY_BLINK, TRAY_BLINK_FAST_MS, NULL);
-    }
+    /* Added up from ticks, so that sleep does not pass for blinking. */
+    g_trayBlinkMs += g_trayBlinkInterval;
+    UpdateTrayBlinkRate();
     NOTIFYICONDATAA data = nid;
     /* Resending the tooltip this often could disturb one that is being read. */
     data.uFlags = NIF_ICON;
@@ -910,9 +934,9 @@ static void StopTrayRegistration(void) {
     g_trayActive = FALSE;
     g_trayRegistered = FALSE;
     g_trayRetryPending = FALSE;
-    g_trayBlinking = FALSE;
+    g_trayBlinkInterval = 0;
     g_trayBlinkHidden = FALSE;
-    g_trayBlinkTicks = 0;
+    g_trayBlinkMs = 0;
     if (nid.hWnd) {
         KillTimer(nid.hWnd, ID_TIMER_TRAY_RETRY);
         KillTimer(nid.hWnd, ID_TIMER_TRAY_BLINK);
@@ -988,6 +1012,16 @@ void CreateContextMenu() {
 
 // --- Registry-based configuration ---
 
+// The choices offered in the configuration dialog; 0 is "Never".
+static BOOL IsFastBlinkChoice(int minutes) {
+    switch (minutes) {
+        case 0: case 1: case 2: case 5: case 10: case 15: case 30: case 60:
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
 BOOL LoadConfigFromRegistry() {
     HKEY hKey;
     LONG result = RegOpenKeyExA(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey);
@@ -1019,6 +1053,15 @@ BOOL LoadConfigFromRegistry() {
                          (LPBYTE)&dwDownInterval, &size) == ERROR_SUCCESS
         && type == REG_DWORD && dwDownInterval >= 1 && dwDownInterval <= 86400) {
         configDownRefreshInterval = (int)dwDownInterval;
+    }
+
+    // Read FastBlinkMinutes (REG_DWORD)
+    DWORD dwFastBlink = FAST_BLINK_DEFAULT_MINUTES;
+    size = sizeof(dwFastBlink);
+    if (RegQueryValueExA(hKey, REG_VALUE_FAST_BLINK, NULL, &type,
+                         (LPBYTE)&dwFastBlink, &size) == ERROR_SUCCESS
+        && type == REG_DWORD && IsFastBlinkChoice((int)dwFastBlink)) {
+        configFastBlinkMinutes = (int)dwFastBlink;
     }
 
     // Read LoggingEnabled (REG_DWORD)
@@ -1087,6 +1130,11 @@ void SaveConfigToRegistry() {
     RegSetValueExA(hKey, REG_VALUE_DOWN_INTERVAL, 0, REG_DWORD,
                    (const BYTE*)&dwDownInterval, sizeof(dwDownInterval));
 
+    // Write FastBlinkMinutes (REG_DWORD)
+    DWORD dwFastBlink = (DWORD)configFastBlinkMinutes;
+    RegSetValueExA(hKey, REG_VALUE_FAST_BLINK, 0, REG_DWORD,
+                   (const BYTE*)&dwFastBlink, sizeof(dwFastBlink));
+
     // Write LoggingEnabled (REG_DWORD)
     DWORD dwLogging = (DWORD)configLoggingEnabled;
     RegSetValueExA(hKey, REG_VALUE_LOGGING, 0, REG_DWORD,
@@ -1102,8 +1150,9 @@ void SaveConfigToRegistry() {
                    (const BYTE*)&dwAutoUpdate, sizeof(dwAutoUpdate));
 
     RegCloseKey(hKey);
-    LogMessage("Configuration saved to registry: URL=%s, HealthyInterval=%d, DownInterval=%d, Logging=%s, HistoryLimit=%d, AutoUpdate=%s",
+    LogMessage("Configuration saved to registry: URL=%s, HealthyInterval=%d, DownInterval=%d, FastBlinkMinutes=%d, Logging=%s, HistoryLimit=%d, AutoUpdate=%s",
                configApiUrl, configRefreshInterval, configDownRefreshInterval,
+               configFastBlinkMinutes,
                configLoggingEnabled ? "enabled" : "disabled", configHistoryLimit,
                configAutoCheckForUpdates ? "enabled" : "disabled");
 }
@@ -1401,6 +1450,7 @@ void LoadHistoryFromRegistry(void) {
 
 void ApplyConfiguration() {
     ScheduleNextRefresh(currentResult);
+    UpdateTrayBlinkRate();
     LogMessage("Configuration applied: URL=%s, HealthyInterval=%d, DownInterval=%d, Logging=%s",
                configApiUrl, configRefreshInterval, configDownRefreshInterval,
                configLoggingEnabled ? "enabled" : "disabled");
@@ -3877,8 +3927,9 @@ static void webview_push_init_config(void) {
 
     wchar_t script[4608];
     swprintf(script, sizeof(script) / sizeof(wchar_t),
-        L"window.onInit({\"view\":\"config\",\"config\":{\"url\":\"%s\",\"healthyInterval\":%d,\"downInterval\":%d,\"loggingEnabled\":%s,\"historyLimit\":%d,\"logPath\":\"%s\",\"startWithWindows\":%s,\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
+        L"window.onInit({\"view\":\"config\",\"config\":{\"url\":\"%s\",\"healthyInterval\":%d,\"downInterval\":%d,\"fastBlinkMinutes\":%d,\"loggingEnabled\":%s,\"historyLimit\":%d,\"logPath\":\"%s\",\"startWithWindows\":%s,\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
         wUrl, configRefreshInterval, configDownRefreshInterval,
+        configFastBlinkMinutes,
         configLoggingEnabled ? L"true" : L"false",
         configHistoryLimit, wLogPath,
         IsStartWithWindowsEnabled() ? L"true" : L"false",
@@ -4148,6 +4199,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         char url[512] = {0};
         int healthyInterval = 60;
         int downInterval = 10;
+        int fastBlinkMinutes = configFastBlinkMinutes;
         BOOL logging = TRUE;
         BOOL autoUpdate = configAutoCheckForUpdates;
         BOOL startWithWindows = FALSE;
@@ -4155,6 +4207,7 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         json_get_string(msg, "url", url, sizeof(url));
         json_get_int(msg, "healthyInterval", &healthyInterval);
         json_get_int(msg, "downInterval", &downInterval);
+        json_get_int(msg, "fastBlinkMinutes", &fastBlinkMinutes);
         json_get_bool(msg, "loggingEnabled", &logging);
         json_get_bool(msg, "autoCheckForUpdates", &autoUpdate);
         BOOL hasStartWithWindows =
@@ -4172,6 +4225,9 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
         if (downInterval == 10 || downInterval == 30 || downInterval == 60 ||
             downInterval == 120 || downInterval == 300) {
             configDownRefreshInterval = downInterval;
+        }
+        if (IsFastBlinkChoice(fastBlinkMinutes)) {
+            configFastBlinkMinutes = fastBlinkMinutes;
         }
         configLoggingEnabled = logging;
         configAutoCheckForUpdates = autoUpdate;
@@ -4193,8 +4249,9 @@ static HRESULT STDMETHODCALLTYPE MsgReceived_Invoke(ICoreWebView2WebMessageRecei
                            startWithWindows ? "enable" : "disable", startupResult);
             }
         }
-        LogMessage("Configuration updated via WebView dialog: URL=%s, HealthyInterval=%d, DownInterval=%d, Logging=%s, HistoryLimit=%d, StartWithWindows=%s, AutoUpdate=%s",
+        LogMessage("Configuration updated via WebView dialog: URL=%s, HealthyInterval=%d, DownInterval=%d, FastBlinkMinutes=%d, Logging=%s, HistoryLimit=%d, StartWithWindows=%s, AutoUpdate=%s",
                    configApiUrl, configRefreshInterval, configDownRefreshInterval,
+                   configFastBlinkMinutes,
                    configLoggingEnabled ? "enabled" : "disabled", configHistoryLimit,
                    IsStartWithWindowsEnabled() ? "enabled" : "disabled",
                    configAutoCheckForUpdates ? "enabled" : "disabled");

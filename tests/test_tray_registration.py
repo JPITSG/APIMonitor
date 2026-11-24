@@ -12,7 +12,7 @@ PROC = "WindowProc"
 
 
 def function(name):
-    match = re.search(r"^(?:static )?(?:void|LRESULT CALLBACK) " + name +
+    match = re.search(r"^(?:static )?(?:void|BOOL|UINT|LRESULT CALLBACK) " + name +
                       r"\([^;{]*\{.*?^}", SOURCE, re.M | re.S)
     if not match:
         raise AssertionError("Missing production function: " + name)
@@ -60,8 +60,11 @@ static NOTIFYICONDATAW cache, published;
 #define g_nid cache
 #define nid cache
 static BOOL g_trayActive, g_trayRegistered, g_trayRetryPending;
-static BOOL g_trayBlinking, g_trayBlinkHidden;
-static UINT g_trayBlinkTicks;
+typedef unsigned long long ULONGLONG;
+static BOOL g_trayBlinkHidden;
+static UINT g_trayBlinkInterval;
+static ULONGLONG g_trayBlinkMs;
+static int configFastBlinkMinutes = FAST_BLINK_DEFAULT_MINUTES;
 static void* hIconEmpty = (void*)1001;
 static void* hIconFail = (void*)1002;
 static void* hIconSuccess = (void*)1003;
@@ -77,7 +80,7 @@ static BOOL Notify(DWORD command, NOTIFYICONDATAW* data) {
     assert(data->hWnd == (HWND)1 && data->uID == 17);
     if (command == NIM_DELETE) { held = 0; deletes++; return TRUE; }
     if (data->uFlags == NIF_ICON) {
-        assert(command == NIM_MODIFY && g_trayBlinking); /* Never a partial ADD. */
+        assert(command == NIM_MODIFY && g_trayBlinkInterval); /* Never a partial ADD. */
         iconOnly++;
         if (!ready || !held) return FALSE;
         published.hIcon = data->hIcon;
@@ -117,10 +120,13 @@ static void KillTimer(HWND window, UINT id) {
 /* A check reporting its icon, as ApplyTrayUpdate does on the window thread. */
 static void Report(void* icon);
 #define TICK() TrayMessages(WM_TIMER, ID_TIMER_TRAY_BLINK)
+#define TICKS(minutes) ((minutes) * 60 * 1000 / TRAY_BLINK_MS)
+/* Save the dialog with another choice, as ApplyConfiguration does. */
+#define CHOOSE(minutes) (configFastBlinkMinutes = (minutes), UpdateTrayBlinkRate())
 /* Blink count times at the current rate, checking that the rate never changes early. */
 #define BLINK(count, rate) do { \
     for (int n = 0; n < (int)(count); n++) { \
-        assert(blinkTimer && blinkDelay == (rate)); \
+        assert(blinkTimer && blinkDelay == (rate) && g_trayBlinkInterval == (rate)); \
         BOOL hidden = g_trayBlinkHidden; \
         calls = 0; \
         TICK(); \
@@ -199,7 +205,7 @@ int main(void) {
     g_trayActive = TRUE;
     RestartTrayBlink();
     PublishTrayIcon();
-    assert(!g_trayBlinking && !blinkTimer && published.hIcon == hIconSuccess);
+    assert(!g_trayBlinkInterval && !blinkTimer && published.hIcon == hIconSuccess);
     before = calls;
     for (int i = 0; i < 10; i++) TICK();
     assert(calls == before); /* Healthy: solid, no extra shell traffic. */
@@ -208,7 +214,7 @@ int main(void) {
     for (int i = 0; i < 2; i++) {
         void* icon = blinkers[i];
         Report(icon);
-        assert(g_trayBlinking && blinkTimer && published.hIcon == icon); /* Visible at once. */
+        assert(g_trayBlinkInterval && blinkTimer && published.hIcon == icon); /* Visible at once. */
         int armed = blinkArms;
         iconOnly = 0;
         for (int n = 0; n < 20; n++) {
@@ -238,7 +244,7 @@ int main(void) {
     TICK();
     assert(published.hIcon == hIconBlank);
     Report(hIconSuccess);
-    assert(!g_trayBlinking && !blinkTimer && published.hIcon == hIconSuccess);
+    assert(!g_trayBlinkInterval && !blinkTimer && published.hIcon == hIconSuccess);
     before = calls;
     TICK();
     assert(calls == before && published.hIcon == hIconSuccess);
@@ -276,48 +282,51 @@ int main(void) {
     Report(hIconSuccess);
     failTimer = 1;
     Report(hIconEmpty);
-    assert(!g_trayBlinking && published.hIcon == hIconEmpty);
+    assert(!g_trayBlinkInterval && published.hIcon == hIconEmpty);
     TICK();
     assert(published.hIcon == hIconEmpty);
     failTimer = 0;
 
-    /* --- Faster after 10 minutes --- */
-    assert(TRAY_BLINK_FAST_AFTER * TRAY_BLINK_MS == 10 * 60 * 1000);
+    /* --- Faster after the configured time --- */
+    assert(configFastBlinkMinutes == 10); /* The default. */
     assert(TRAY_BLINK_FAST_MS < TRAY_BLINK_MS);
-    for (int i = 0; i < 2; i++) {
-        Report(hIconSuccess);
-        assert(!blinkTimer && g_trayBlinkTicks == 0);
-        Report(blinkers[i]);
-        BLINK(TRAY_BLINK_FAST_AFTER - 1, TRAY_BLINK_MS); /* Just short of 10 minutes. */
-        assert(blinkDelay == TRAY_BLINK_MS);
-        BLINK(1, TRAY_BLINK_MS);
-        assert(blinkDelay == TRAY_BLINK_FAST_MS && cache.hIcon == blinkers[i]);
-        int armed = blinkArms;
-        BLINK(3 * TRAY_BLINK_FAST_AFTER, TRAY_BLINK_FAST_MS); /* Stays fast; armed once. */
-        Report(blinkers[i]); /* Further failing checks change nothing. */
-        BLINK(5, TRAY_BLINK_FAST_MS);
-        assert(blinkArms == armed);
-        Report(blinkers[!i]); /* Still the same outage: fast from the first blink. */
-        assert(published.hIcon == blinkers[!i]);
-        BLINK(5, TRAY_BLINK_FAST_MS);
+    int choices[] = { 10, 1, 60 };
+    for (int c = 0; c < 3; c++) {
+        CHOOSE(choices[c]);
+        for (int i = 0; i < 2; i++) {
+            Report(hIconSuccess);
+            assert(!blinkTimer && g_trayBlinkMs == 0);
+            Report(blinkers[i]);
+            BLINK(TICKS(choices[c]), TRAY_BLINK_MS); /* Not a moment early... */
+            assert(blinkDelay == TRAY_BLINK_FAST_MS && cache.hIcon == blinkers[i]);
+            int armed = blinkArms;
+            BLINK(5000, TRAY_BLINK_FAST_MS); /* ...then for good, armed once. */
+            Report(blinkers[i]); /* Further failing checks change nothing. */
+            BLINK(5, TRAY_BLINK_FAST_MS);
+            assert(blinkArms == armed);
+            Report(blinkers[!i]); /* Still the same outage: fast from the first blink. */
+            assert(published.hIcon == blinkers[!i]);
+            BLINK(5, TRAY_BLINK_FAST_MS);
+        }
     }
+    CHOOSE(10);
 
-    /* Changing icons part-way neither restarts nor loses the 10 minutes. */
+    /* Changing icons part-way neither restarts nor loses the time so far. */
     Report(hIconSuccess);
     Report(hIconEmpty);
-    BLINK(TRAY_BLINK_FAST_AFTER / 2, TRAY_BLINK_MS);
+    BLINK(TICKS(4), TRAY_BLINK_MS);
     Report(hIconFail);
-    BLINK(TRAY_BLINK_FAST_AFTER - TRAY_BLINK_FAST_AFTER / 2, TRAY_BLINK_MS);
+    BLINK(TICKS(6), TRAY_BLINK_MS);
     assert(blinkDelay == TRAY_BLINK_FAST_MS);
 
     /* Returning to green starts over, even one blink before the limit. */
     Report(hIconSuccess);
     assert(!blinkTimer && published.hIcon == hIconSuccess);
     Report(hIconFail);
-    BLINK(TRAY_BLINK_FAST_AFTER - 1, TRAY_BLINK_MS);
+    BLINK(TICKS(10) - 1, TRAY_BLINK_MS);
     Report(hIconSuccess);
     Report(hIconFail);
-    BLINK(TRAY_BLINK_FAST_AFTER - 1, TRAY_BLINK_MS);
+    BLINK(TICKS(10) - 1, TRAY_BLINK_MS);
     assert(blinkDelay == TRAY_BLINK_MS);
 
     /* Nothing blinks while Explorer is away, so that time is not counted. */
@@ -330,12 +339,47 @@ int main(void) {
     TrayMessages(WM_TIMER, ID_TIMER_TRAY_RETRY);
     assert(held && blinkDelay == TRAY_BLINK_MS);
 
-    /* If the faster timer cannot be set, the running one simply continues. */
+    /* If the faster timer cannot be set, the running one continues until it can. */
     failTimer = 1;
     BLINK(1, TRAY_BLINK_MS);
     BLINK(20, TRAY_BLINK_MS);
-    assert(g_trayBlinking && blinkTimer);
     failTimer = 0;
+    BLINK(1, TRAY_BLINK_MS);
+    BLINK(5, TRAY_BLINK_FAST_MS);
+
+    /* Never means never, and the time still counts if that is changed later. */
+    Report(hIconSuccess);
+    CHOOSE(0);
+    Report(hIconEmpty);
+    BLINK(TICKS(90), TRAY_BLINK_MS);
+    Report(hIconFail);
+    BLINK(5, TRAY_BLINK_MS);
+    BOOL hidden = g_trayBlinkHidden;
+    CHOOSE(60); /* Saved during an outage: applies at once, mid-rhythm. */
+    assert(blinkDelay == TRAY_BLINK_FAST_MS && g_trayBlinkHidden == hidden);
+    BLINK(5, TRAY_BLINK_FAST_MS);
+    before = blinkArms;
+    CHOOSE(10); /* Already past this one too: nothing to do. */
+    assert(blinkArms == before);
+    CHOOSE(0);
+    assert(blinkDelay == TRAY_BLINK_MS);
+    BLINK(5, TRAY_BLINK_MS);
+
+    /* Choosing a longer time goes back to normal until it is reached. */
+    Report(hIconSuccess);
+    CHOOSE(1);
+    Report(hIconFail);
+    BLINK(TICKS(1), TRAY_BLINK_MS);
+    assert(blinkDelay == TRAY_BLINK_FAST_MS);
+    CHOOSE(2);
+    BLINK(TICKS(1), TRAY_BLINK_MS);
+    assert(blinkDelay == TRAY_BLINK_FAST_MS);
+
+    /* Saving settings never starts a blink on a healthy icon. */
+    Report(hIconSuccess);
+    before = blinkArms;
+    CHOOSE(10); CHOOSE(0); CHOOSE(10);
+    assert(blinkArms == before && !blinkTimer && !g_trayBlinkInterval);
 
     /* Shutdown: no tick may use the icon handles once they are about to be destroyed. */
     Report(hIconFail);
@@ -344,15 +388,18 @@ int main(void) {
     before = calls;
     TICK();
     BlinkTrayIcon();
-    assert(calls == before && !blinkTimer && !g_trayBlinking && !g_trayBlinkHidden && !held);
-    assert(g_trayBlinkTicks == 0);
+    CHOOSE(1);
+    assert(calls == before && !blinkTimer && !g_trayBlinkInterval && !g_trayBlinkHidden && !held);
+    assert(g_trayBlinkMs == 0);
     puts("tray lifecycle passed");
     return 0;
 }
 '''
-        defines = "\n".join(re.findall(r"^#define (?:ID_TIMER_TRAY_RETRY|TRAY_RETRY_MS|ID_TIMER_TRAY_BLINK|TRAY_BLINK_\w+) .+$", SOURCE, re.M))
+        defines = "\n".join(re.findall(r"^#define (?:ID_TIMER_TRAY_RETRY|TRAY_RETRY_MS|ID_TIMER_TRAY_BLINK|TRAY_BLINK_\w+|FAST_BLINK_\w+) .+$", SOURCE, re.M))
         harness = defines + "\n" + stubs + "\n".join(map(function, (
-            "PublishTrayIcon", "RestartTrayBlink", "BlinkTrayIcon", "StopTrayRegistration")))
+            "PublishTrayIcon", "TrayBlinkIntervalDue", "StartTrayBlinkTimer",
+            "UpdateTrayBlinkRate", "RestartTrayBlink", "BlinkTrayIcon",
+            "StopTrayRegistration")))
         harness += "\nstatic LRESULT TrayMessages(UINT msg, WPARAM wParam) {" + messages + "return -1;\n}\n"
         apply = re.sub(r"memcpy\(nid.szTip[^;]*;", "", function("ApplyTrayUpdate"))
         harness += "typedef struct { UINT flags; void* icon; } TrayUpdate;\n" + apply
@@ -459,6 +506,33 @@ int main(void) {
         self.assertRegex(proc, r"case WM_DESTROY:\s+StopTrayRegistration\(\);")
         ids = re.findall(r"^#define ID_TIMER_\w+\s+(\d+)\s*$", SOURCE, re.M)
         self.assertEqual(len(ids), len(set(ids)), "Retry timer must not collide with another timer")
+
+    def test_fast_blink_setting(self):
+        dialog = (ROOT / "assets/src/ConfigView.tsx").read_text()
+        select = dialog[dialog.index('id="fast-blink"'):]
+        select = select[:select.index("</select>")]
+        offered = dict(re.findall(r"<option value=\{(\d+)\}>([^<]+)</option>", select))
+        allowed = re.findall(r"case (\d+):", function("IsFastBlinkChoice"))
+        self.assertEqual(sorted(offered), sorted(allowed), "Every offered choice must be accepted")
+        self.assertEqual(offered["0"], "Never")
+        default = re.search(r"^#define FAST_BLINK_DEFAULT_MINUTES (\d+)$", SOURCE, re.M).group(1)
+        self.assertEqual(offered[default], "After 10 minutes")
+        self.assertEqual(dialog.count("config.fastBlinkMinutes ?? " + default), 2)
+        # Loaded, saved, sent to the dialog, taken back, and applied straight away.
+        load, save = (function(name) for name in ("LoadConfigFromRegistry", "SaveConfigToRegistry"))
+        self.assertRegex(load, r"REG_VALUE_FAST_BLINK[\s\S]*?type == REG_DWORD && IsFastBlinkChoice")
+        self.assertIn("REG_VALUE_FAST_BLINK, 0, REG_DWORD", save)
+        self.assertIn('\\"fastBlinkMinutes\\":%d', SOURCE)
+        handler = SOURCE[SOURCE.index('strcmp(action, "saveSettings")'):]
+        handler = handler[:handler.index('strcmp(action, "close")')]
+        self.assertIn("int fastBlinkMinutes = configFastBlinkMinutes;", handler)
+        self.assertIn('json_get_int(msg, "fastBlinkMinutes", &fastBlinkMinutes);', handler)
+        self.assertRegex(handler, r"if \(IsFastBlinkChoice\(fastBlinkMinutes\)\) \{\s+"
+                                  r"configFastBlinkMinutes = fastBlinkMinutes;")
+        self.assertLess(handler.index("configFastBlinkMinutes = fast"),
+                        handler.index("SaveConfigToRegistry();"))
+        self.assertLess(handler.index("SaveConfigToRegistry();"), handler.index("ApplyConfiguration();"))
+        self.assertIn("UpdateTrayBlinkRate();", function("ApplyConfiguration"))
 
     def test_icon_artwork(self):
         icons = {name: (ROOT / "assets" / (name + ".ico")).read_bytes()

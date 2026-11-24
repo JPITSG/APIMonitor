@@ -2,6 +2,8 @@ export interface ConfigData {
   url: string;
   healthyInterval: number;
   downInterval: number;
+  /** Minutes of blinking before it becomes faster; 0 = never. */
+  fastBlinkMinutes: number;
   loggingEnabled: boolean;
   historyLimit: number;
   logPath?: string;
@@ -157,6 +159,7 @@ export function saveSettings(config: ConfigData) {
     url: config.url,
     healthyInterval: config.healthyInterval,
     downInterval: config.downInterval,
+    fastBlinkMinutes: config.fastBlinkMinutes,
     loggingEnabled: config.loggingEnabled,
     historyLimit: config.historyLimit,
     startWithWindows: config.startWithWindows,

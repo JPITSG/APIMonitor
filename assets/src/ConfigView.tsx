@@ -25,6 +25,9 @@ import {
   type ValidationResult,
 } from "./lib/bridge";
 
+const selectClassName =
+  "w-40 h-8 rounded-md border border-neutral-300 bg-transparent px-3 py-1 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400";
+
 interface ConfigViewProps {
   config: ConfigData;
   updateCompletedVersion: string;
@@ -39,6 +42,9 @@ export default function ConfigView({
     config.healthyInterval ?? 60
   );
   const [downInterval, setDownInterval] = useState(config.downInterval ?? 10);
+  const [fastBlinkMinutes, setFastBlinkMinutes] = useState(
+    config.fastBlinkMinutes ?? 10
+  );
   const [loggingEnabled, setLoggingEnabled] = useState(config.loggingEnabled);
   const [historyLimit, setHistoryLimit] = useState(String(config.historyLimit));
   const [startWithWindows, setStartWithWindows] = useState(
@@ -78,6 +84,7 @@ export default function ConfigView({
     url !== config.url ||
     healthyInterval !== (config.healthyInterval ?? 60) ||
     downInterval !== (config.downInterval ?? 10) ||
+    fastBlinkMinutes !== (config.fastBlinkMinutes ?? 10) ||
     loggingEnabled !== config.loggingEnabled ||
     historyLimit !== String(config.historyLimit) ||
     startWithWindows !== (config.startWithWindows ?? false) ||
@@ -239,6 +246,7 @@ export default function ConfigView({
       url: trimmedUrl,
       healthyInterval,
       downInterval,
+      fastBlinkMinutes,
       loggingEnabled,
       historyLimit: hl,
       startWithWindows,
@@ -290,7 +298,7 @@ export default function ConfigView({
             id="healthy-interval"
             value={healthyInterval}
             onChange={(e) => setHealthyInterval(Number(e.target.value))}
-            className="w-40 h-8 rounded-md border border-neutral-300 bg-transparent px-3 py-1 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400"
+            className={selectClassName}
           >
             <option value={60}>Every 1 minute</option>
             <option value={120}>Every 2 minutes</option>
@@ -304,13 +312,32 @@ export default function ConfigView({
             id="down-interval"
             value={downInterval}
             onChange={(e) => setDownInterval(Number(e.target.value))}
-            className="w-40 h-8 rounded-md border border-neutral-300 bg-transparent px-3 py-1 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-400"
+            className={selectClassName}
           >
             <option value={10}>Every 10 seconds</option>
             <option value={30}>Every 30 seconds</option>
             <option value={60}>Every 1 minute</option>
             <option value={120}>Every 2 minutes</option>
             <option value={300}>Every 5 minutes</option>
+          </select>
+        </div>
+
+        <div data-row className="flex items-center justify-between">
+          <Label htmlFor="fast-blink">Blink Faster When Still Down</Label>
+          <select
+            id="fast-blink"
+            value={fastBlinkMinutes}
+            onChange={(e) => setFastBlinkMinutes(Number(e.target.value))}
+            className={selectClassName}
+          >
+            <option value={1}>After 1 minute</option>
+            <option value={2}>After 2 minutes</option>
+            <option value={5}>After 5 minutes</option>
+            <option value={10}>After 10 minutes</option>
+            <option value={15}>After 15 minutes</option>
+            <option value={30}>After 30 minutes</option>
+            <option value={60}>After 1 hour</option>
+            <option value={0}>Never</option>
           </select>
         </div>
 
