@@ -61,12 +61,14 @@ static NOTIFYICONDATAW cache, published;
 #define nid cache
 static BOOL g_trayActive, g_trayRegistered, g_trayRetryPending;
 static BOOL g_trayBlinking, g_trayBlinkHidden;
+static UINT g_trayBlinkTicks;
 static void* hIconEmpty = (void*)1001;
 static void* hIconFail = (void*)1002;
 static void* hIconSuccess = (void*)1003;
 static void* hIconBlank = (void*)1004;
 static UINT g_WM_TASKBARCREATED = 0xc001;
 static int ready, held, timer, failTimer, arms, calls, deletes, blinkTimer, blinkArms;
+static UINT blinkDelay; /* Interval of the running blink timer. */
 static int iconOnly; /* Expect (and count) blink ticks, which never resend the tooltip. */
 static DWORD commands[4096];
 static BOOL Notify(DWORD command, NOTIFYICONDATAW* data) {
@@ -93,10 +95,11 @@ static BOOL Notify(DWORD command, NOTIFYICONDATAW* data) {
 static UINT SetTimer(HWND window, UINT id, UINT delay, void* callback) {
     assert(window == (HWND)1 && callback == NULL);
     if (id == ID_TIMER_TRAY_BLINK) {
-        assert(delay == TRAY_BLINK_MS);
+        assert(delay == TRAY_BLINK_MS || delay == TRAY_BLINK_FAST_MS);
         if (failTimer) return 0;
         blinkArms++;
         blinkTimer = 1;
+        blinkDelay = delay;
         return id;
     }
     assert(id == ID_TIMER_TRAY_RETRY && delay == 2000);
@@ -107,13 +110,23 @@ static UINT SetTimer(HWND window, UINT id, UINT delay, void* callback) {
 }
 static void KillTimer(HWND window, UINT id) {
     assert(window == (HWND)1);
-    if (id == ID_TIMER_TRAY_BLINK) { blinkTimer = 0; return; }
+    if (id == ID_TIMER_TRAY_BLINK) { blinkTimer = 0; blinkDelay = 0; return; }
     assert(id == ID_TIMER_TRAY_RETRY);
     timer = 0;
 }
 /* A check reporting its icon, as ApplyTrayUpdate does on the window thread. */
 static void Report(void* icon);
 #define TICK() TrayMessages(WM_TIMER, ID_TIMER_TRAY_BLINK)
+/* Blink count times at the current rate, checking that the rate never changes early. */
+#define BLINK(count, rate) do { \
+    for (int n = 0; n < (int)(count); n++) { \
+        assert(blinkTimer && blinkDelay == (rate)); \
+        BOOL hidden = g_trayBlinkHidden; \
+        calls = 0; \
+        TICK(); \
+        assert(published.hIcon == (hidden ? cache.hIcon : hIconBlank)); \
+    } \
+} while (0)
 '''
         assertions = r'''
 int main(void) {
@@ -268,6 +281,62 @@ int main(void) {
     assert(published.hIcon == hIconEmpty);
     failTimer = 0;
 
+    /* --- Faster after 10 minutes --- */
+    assert(TRAY_BLINK_FAST_AFTER * TRAY_BLINK_MS == 10 * 60 * 1000);
+    assert(TRAY_BLINK_FAST_MS < TRAY_BLINK_MS);
+    for (int i = 0; i < 2; i++) {
+        Report(hIconSuccess);
+        assert(!blinkTimer && g_trayBlinkTicks == 0);
+        Report(blinkers[i]);
+        BLINK(TRAY_BLINK_FAST_AFTER - 1, TRAY_BLINK_MS); /* Just short of 10 minutes. */
+        assert(blinkDelay == TRAY_BLINK_MS);
+        BLINK(1, TRAY_BLINK_MS);
+        assert(blinkDelay == TRAY_BLINK_FAST_MS && cache.hIcon == blinkers[i]);
+        int armed = blinkArms;
+        BLINK(3 * TRAY_BLINK_FAST_AFTER, TRAY_BLINK_FAST_MS); /* Stays fast; armed once. */
+        Report(blinkers[i]); /* Further failing checks change nothing. */
+        BLINK(5, TRAY_BLINK_FAST_MS);
+        assert(blinkArms == armed);
+        Report(blinkers[!i]); /* Still the same outage: fast from the first blink. */
+        assert(published.hIcon == blinkers[!i]);
+        BLINK(5, TRAY_BLINK_FAST_MS);
+    }
+
+    /* Changing icons part-way neither restarts nor loses the 10 minutes. */
+    Report(hIconSuccess);
+    Report(hIconEmpty);
+    BLINK(TRAY_BLINK_FAST_AFTER / 2, TRAY_BLINK_MS);
+    Report(hIconFail);
+    BLINK(TRAY_BLINK_FAST_AFTER - TRAY_BLINK_FAST_AFTER / 2, TRAY_BLINK_MS);
+    assert(blinkDelay == TRAY_BLINK_FAST_MS);
+
+    /* Returning to green starts over, even one blink before the limit. */
+    Report(hIconSuccess);
+    assert(!blinkTimer && published.hIcon == hIconSuccess);
+    Report(hIconFail);
+    BLINK(TRAY_BLINK_FAST_AFTER - 1, TRAY_BLINK_MS);
+    Report(hIconSuccess);
+    Report(hIconFail);
+    BLINK(TRAY_BLINK_FAST_AFTER - 1, TRAY_BLINK_MS);
+    assert(blinkDelay == TRAY_BLINK_MS);
+
+    /* Nothing blinks while Explorer is away, so that time is not counted. */
+    ready = 0; held = 0;
+    calls = 0;
+    TrayMessages(g_WM_TASKBARCREATED, 0);
+    for (int i = 0; i < 2000; i++) TICK();
+    assert(blinkDelay == TRAY_BLINK_MS);
+    ready = 1;
+    TrayMessages(WM_TIMER, ID_TIMER_TRAY_RETRY);
+    assert(held && blinkDelay == TRAY_BLINK_MS);
+
+    /* If the faster timer cannot be set, the running one simply continues. */
+    failTimer = 1;
+    BLINK(1, TRAY_BLINK_MS);
+    BLINK(20, TRAY_BLINK_MS);
+    assert(g_trayBlinking && blinkTimer);
+    failTimer = 0;
+
     /* Shutdown: no tick may use the icon handles once they are about to be destroyed. */
     Report(hIconFail);
     TICK();
@@ -276,11 +345,12 @@ int main(void) {
     TICK();
     BlinkTrayIcon();
     assert(calls == before && !blinkTimer && !g_trayBlinking && !g_trayBlinkHidden && !held);
+    assert(g_trayBlinkTicks == 0);
     puts("tray lifecycle passed");
     return 0;
 }
 '''
-        defines = "\n".join(re.findall(r"^#define (?:ID_TIMER_TRAY_RETRY|TRAY_RETRY_MS|ID_TIMER_TRAY_BLINK|TRAY_BLINK_MS) .+$", SOURCE, re.M))
+        defines = "\n".join(re.findall(r"^#define (?:ID_TIMER_TRAY_RETRY|TRAY_RETRY_MS|ID_TIMER_TRAY_BLINK|TRAY_BLINK_\w+) .+$", SOURCE, re.M))
         harness = defines + "\n" + stubs + "\n".join(map(function, (
             "PublishTrayIcon", "RestartTrayBlink", "BlinkTrayIcon", "StopTrayRegistration")))
         harness += "\nstatic LRESULT TrayMessages(UINT msg, WPARAM wParam) {" + messages + "return -1;\n}\n"

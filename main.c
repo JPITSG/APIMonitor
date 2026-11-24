@@ -35,6 +35,8 @@
 #define TRAY_RETRY_MS 2000
 #define ID_TIMER_TRAY_BLINK 1010
 #define TRAY_BLINK_MS 500
+#define TRAY_BLINK_FAST_MS 250
+#define TRAY_BLINK_FAST_AFTER ((10u * 60u * 1000u) / TRAY_BLINK_MS)  // Ticks in 10 minutes
 
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_EXIT 1001
@@ -114,6 +116,7 @@ static BOOL g_trayRegistered = FALSE;
 static BOOL g_trayRetryPending = FALSE;
 static BOOL g_trayBlinking = FALSE;     // The current status icon is one that blinks
 static BOOL g_trayBlinkHidden = FALSE;  // ...and is in its hidden half-cycle
+static UINT g_trayBlinkTicks = 0;       // Blink ticks since the last healthy status
 static void PublishTrayIcon(void);
 static void RestartTrayBlink(void);
 static void BlinkTrayIcon(void);
@@ -864,17 +867,22 @@ static void PublishTrayIcon(void) {
     }
 }
 
-/* The question mark and the cross blink for as long as either one is shown.
+/* The question mark and the cross blink for as long as either one is shown, and
+ * faster once that has gone on for 10 minutes. Changing from one to the other
+ * keeps counting; only a healthy status starts over.
  * nid.hIcon always stays the real status icon; only what is published changes.
  * A new status is always visible straight away. */
 static void RestartTrayBlink(void) {
     g_trayBlinkHidden = FALSE;
     g_trayBlinking = FALSE;
     if (nid.hIcon == hIconEmpty || nid.hIcon == hIconFail) {
+        UINT interval = g_trayBlinkTicks < TRAY_BLINK_FAST_AFTER
+            ? TRAY_BLINK_MS : TRAY_BLINK_FAST_MS;
         g_trayBlinking = SetTimer(nid.hWnd, ID_TIMER_TRAY_BLINK,
-                                  TRAY_BLINK_MS, NULL) != 0;
+                                  interval, NULL) != 0;
         if (!g_trayBlinking) LogMessage("Could not start tray blink timer");
     } else {
+        g_trayBlinkTicks = 0;
         KillTimer(nid.hWnd, ID_TIMER_TRAY_BLINK);
     }
 }
@@ -883,6 +891,12 @@ static void BlinkTrayIcon(void) {
     /* Only the retry timer may try to register a missing icon. */
     if (!g_trayActive || !g_trayRegistered) return;
     g_trayBlinkHidden = !g_trayBlinkHidden;
+    /* Counted, not timed, so that sleep does not pass for blinking. */
+    if (g_trayBlinkTicks < TRAY_BLINK_FAST_AFTER &&
+        ++g_trayBlinkTicks == TRAY_BLINK_FAST_AFTER) {
+        LogMessage("Tray icon has been blinking for 10 minutes; blinking faster");
+        SetTimer(nid.hWnd, ID_TIMER_TRAY_BLINK, TRAY_BLINK_FAST_MS, NULL);
+    }
     NOTIFYICONDATAA data = nid;
     /* Resending the tooltip this often could disturb one that is being read. */
     data.uFlags = NIF_ICON;
@@ -898,6 +912,7 @@ static void StopTrayRegistration(void) {
     g_trayRetryPending = FALSE;
     g_trayBlinking = FALSE;
     g_trayBlinkHidden = FALSE;
+    g_trayBlinkTicks = 0;
     if (nid.hWnd) {
         KillTimer(nid.hWnd, ID_TIMER_TRAY_RETRY);
         KillTimer(nid.hWnd, ID_TIMER_TRAY_BLINK);

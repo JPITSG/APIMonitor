@@ -62,6 +62,7 @@ Or using the short tag:
 | Invalid (bad XML) | Red question mark, blinking | Configured down interval (default 10s) |
 
 The question mark is also shown from startup until the first check finishes.
+After 10 minutes without returning to green, the blinking becomes twice as fast.
 
 Each interval starts after the preceding API check, including its retry cycle,
 has fully completed. A new scheduled or manual check cannot overlap one already
